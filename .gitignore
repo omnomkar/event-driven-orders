@@ -1,0 +1,19 @@
+# Go build output
+/bin/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Workspace checksum file (go.work is for local editor support only)
+go.work.sum
+
+# Local environment overrides (copy .env.example to .env)
+.env
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
