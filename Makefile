@@ -16,9 +16,10 @@ up:
 down:
 	$(COMPOSE) down
 
-## proto: lint, format, and regenerate Go code from proto/
+## proto: lint, format, and regenerate Go code from proto/ (stale generated files are removed first)
 proto:
-	cd proto && buf lint && buf format -w && buf generate
+	cd proto && buf lint && buf format -w && rm -rf gen/go/eventorders && buf generate
+	cd proto/gen/go && go mod tidy
 
 ## lint: run golangci-lint in every Go module
 lint:

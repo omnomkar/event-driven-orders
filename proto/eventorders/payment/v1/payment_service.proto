@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package eventorders.payment.v1;
+
+// PaymentService exchanges card details for an opaque token. Charges happen over Kafka.
+service PaymentService {
+  rpc TokenizeCard(TokenizeCardRequest) returns (TokenizeCardResponse);
+}
+
+// There is deliberately no CVV field: it is never accepted or stored.
+message TokenizeCardRequest {
+  string card_number = 1;
+  int32 exp_month = 2;
+  int32 exp_year = 3;
+}
+
+message TokenizeCardResponse {
+  string payment_token = 1;
+  string last4 = 2;
+  string brand = 3;
+}

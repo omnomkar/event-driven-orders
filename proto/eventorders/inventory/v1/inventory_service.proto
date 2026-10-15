@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package eventorders.inventory.v1;
+
+// InventoryService serves product and stock reads. Reservations happen over Kafka.
+service InventoryService {
+  rpc GetProduct(GetProductRequest) returns (GetProductResponse);
+  rpc ListProducts(ListProductsRequest) returns (ListProductsResponse);
+}
+
+message Product {
+  string product_id = 1;
+  string name = 2;
+  int64 unit_price_cents = 3;
+  // ISO 4217 code, for example "USD".
+  string currency = 4;
+  int32 available_quantity = 5;
+}
+
+message GetProductRequest {
+  string product_id = 1;
+}
+
+message GetProductResponse {
+  Product product = 1;
+}
+
+message ListProductsRequest {}
+
+message ListProductsResponse {
+  repeated Product products = 1;
+}

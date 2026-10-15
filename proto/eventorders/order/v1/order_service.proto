@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package eventorders.order.v1;
+
+import "eventorders/common/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+// OrderService creates orders and starts the saga that confirms or cancels them.
+service OrderService {
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
+}
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_PENDING = 1;
+  ORDER_STATUS_INVENTORY_RESERVED = 2;
+  ORDER_STATUS_CONFIRMED = 3;
+  ORDER_STATUS_CANCELLED = 4;
+}
+
+message Order {
+  string order_id = 1;
+  string customer_id = 2;
+  OrderStatus status = 3;
+  repeated eventorders.common.v1.LineItem items = 4;
+  // Total and currency are set from StockReserved, so they are empty while PENDING.
+  int64 total_cents = 5;
+  // ISO 4217 code, for example "USD".
+  string currency = 6;
+  string cancel_reason = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+message CreateOrderRequest {
+  string customer_id = 1;
+  repeated eventorders.common.v1.LineItem items = 2;
+  // Opaque token from PaymentService.TokenizeCard. Never a card number.
+  string payment_token = 3;
+  // Repeating a request with the same key returns the original order.
+  string idempotency_key = 4;
+}
+
+message CreateOrderResponse {
+  Order order = 1;
+}
+
+message GetOrderRequest {
+  string order_id = 1;
+}
+
+message GetOrderResponse {
+  Order order = 1;
+}

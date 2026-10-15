@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package eventorders.events.v1;
+
+import "eventorders/common/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+// InventoryCommand is the only message type on the inventory.commands topic.
+message InventoryCommand {
+  // Unique per message; consumers use it to skip redeliveries.
+  string message_id = 1;
+  // Correlation ID and Kafka partition key.
+  string order_id = 2;
+  google.protobuf.Timestamp created_at = 3;
+
+  oneof command {
+    ReserveStock reserve_stock = 4;
+    ReleaseStock release_stock = 5;
+  }
+}
+
+// ReserveStock reserves every item or none of them.
+message ReserveStock {
+  repeated eventorders.common.v1.LineItem items = 1;
+}
+
+// ReleaseStock undoes the reservation held for the order_id on the wrapper.
+message ReleaseStock {}
+
+// InventoryEvent is the only message type on the inventory.events topic.
+message InventoryEvent {
+  string message_id = 1;
+  string order_id = 2;
+  google.protobuf.Timestamp created_at = 3;
+
+  oneof event {
+    StockReserved stock_reserved = 4;
+    StockRejected stock_rejected = 5;
+    StockReleased stock_released = 6;
+  }
+}
+
+// PricedLine is a reserved line item with the unit price inventory charged for it.
+message PricedLine {
+  string product_id = 1;
+  int32 quantity = 2;
+  int64 unit_price_cents = 3;
+}
+
+message StockReserved {
+  repeated PricedLine lines = 1;
+  int64 total_cents = 2;
+  // ISO 4217 code, for example "USD".
+  string currency = 3;
+}
+
+message StockRejected {
+  string reason = 1;
+  // The first product that could not be reserved.
+  string product_id = 2;
+}
+
+message StockReleased {}

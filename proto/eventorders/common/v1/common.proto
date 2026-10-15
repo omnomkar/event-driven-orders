@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package eventorders.common.v1;
+
+// LineItem is one product and quantity in an order, before pricing.
+message LineItem {
+  string product_id = 1;
+  // Must be greater than zero; validated by the receiving service.
+  int32 quantity = 2;
+}

@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package eventorders.events.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// OrderEvent is the only message type on the order.events topic. It announces
+// order lifecycle changes to other consumers and does not drive the saga.
+message OrderEvent {
+  // Unique per message; consumers use it to skip redeliveries.
+  string message_id = 1;
+  // Correlation ID and Kafka partition key.
+  string order_id = 2;
+  google.protobuf.Timestamp created_at = 3;
+
+  oneof event {
+    OrderCreated order_created = 4;
+    OrderConfirmed order_confirmed = 5;
+    OrderCancelled order_cancelled = 6;
+  }
+}
+
+message OrderCreated {
+  string customer_id = 1;
+  string payment_token = 2;
+  int64 total_cents = 3;
+  // ISO 4217 code, for example "USD".
+  string currency = 4;
+}
+
+message OrderConfirmed {}
+
+message OrderCancelled {
+  string reason = 1;
+}

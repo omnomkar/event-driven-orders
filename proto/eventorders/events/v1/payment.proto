@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package eventorders.events.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// PaymentCommand is the only message type on the payment.commands topic.
+message PaymentCommand {
+  // Unique per message; consumers use it to skip redeliveries.
+  string message_id = 1;
+  // Correlation ID and Kafka partition key.
+  string order_id = 2;
+  google.protobuf.Timestamp created_at = 3;
+
+  oneof command {
+    ChargePayment charge_payment = 4;
+  }
+}
+
+message ChargePayment {
+  string payment_token = 1;
+  int64 amount_cents = 2;
+  // ISO 4217 code, for example "USD".
+  string currency = 3;
+}
+
+// PaymentEvent is the only message type on the payment.events topic.
+message PaymentEvent {
+  string message_id = 1;
+  string order_id = 2;
+  google.protobuf.Timestamp created_at = 3;
+
+  oneof event {
+    PaymentSucceeded payment_succeeded = 4;
+    PaymentFailed payment_failed = 5;
+  }
+}
+
+message PaymentSucceeded {
+  string payment_id = 1;
+}
+
+message PaymentFailed {
+  string reason = 1;
+}
