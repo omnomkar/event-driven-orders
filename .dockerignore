@@ -1,0 +1,13 @@
+# Keep image build contexts small: only pkg/, proto/, and services/ are needed.
+.git
+.github
+docs
+loadtest
+deploy
+**/bin
+.env
+.vscode
+.idea
+*.swp
+*~
+.DS_Store

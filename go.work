@@ -1,3 +1,10 @@
 go 1.27.2
 
-use ./proto/gen/go
+use (
+	./pkg
+	./proto/gen/go
+	./services/gateway
+	./services/inventory
+	./services/order
+	./services/payment
+)

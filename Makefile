@@ -1,6 +1,9 @@
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -euo pipefail -c
 
+# Build and test each module through its own go.mod, exactly as CI and Docker do.
+export GOWORK := off
+
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml
 
 # Every directory containing a go.mod, excluding vendored or hidden paths.
