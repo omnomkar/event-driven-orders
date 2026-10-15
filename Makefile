@@ -5,6 +5,7 @@ SHELL := /usr/bin/env bash
 export GOWORK := off
 
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml
+COMPOSE_ENV := deploy/compose/.env
 
 # Every directory containing a go.mod, excluding vendored or hidden paths.
 MODULES := $(shell find . -name go.mod -not -path './.*' -exec dirname {} \; | sort)
@@ -12,12 +13,16 @@ MODULES := $(shell find . -name go.mod -not -path './.*' -exec dirname {} \; | s
 .PHONY: up down proto lint test ready
 
 ## up: build images and start the local stack, waiting until every container is healthy
-up:
+up: $(COMPOSE_ENV)
 	$(COMPOSE) up --build --wait
 
-## down: stop the local stack and remove its containers
+## down: stop the local stack and remove its containers and volumes
 down:
-	$(COMPOSE) down
+	$(COMPOSE) down --volumes
+
+# Local dev passwords: create .env from the committed example on first use.
+$(COMPOSE_ENV):
+	cp deploy/compose/.env.example $@
 
 ## proto: lint, format, and regenerate Go code from proto/ (stale generated files are removed first)
 proto:

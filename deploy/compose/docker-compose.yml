@@ -1,0 +1,164 @@
+# Local stack: Kafka (KRaft), Postgres, Redis, and the four services.
+# Used as-is for local development and in CI.
+#   make up      build and start, waiting until every container is healthy
+#   make ready   check /readyz on every service and database role isolation
+#   make down    stop and remove containers and volumes
+
+name: eventorders
+
+x-service-env: &service-env
+  KAFKA_BROKERS: kafka:9092
+  SHUTDOWN_TIMEOUT: 10s
+
+x-service-healthcheck: &service-healthcheck
+  interval: 5s
+  timeout: 4s
+  retries: 12
+  start_period: 10s
+
+x-backend-depends: &backend-depends
+  postgres:
+    condition: service_healthy
+  kafka-init:
+    condition: service_completed_successfully
+
+services:
+  kafka:
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single broker, so internal topics cannot be replicated.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by kafka-init, never by a typo in a producer.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Keep the broker small enough for a laptop and a CI runner.
+      KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
+    healthcheck:
+      # The CLI starts its own JVM; give it a small heap instead of the broker's.
+      test: ["CMD-SHELL", "KAFKA_HEAP_OPTS=-Xmx128m /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # One-shot: creates the topics, then exits 0. Services wait for it to finish.
+  kafka-init:
+    image: apache/kafka:4.3.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVER: kafka:9092
+      KAFKA_HEAP_OPTS: -Xmx128m
+    volumes:
+      - ./create-topics.sh:/create-topics.sh:ro
+    entrypoint: ["bash", "/create-topics.sh"]
+    restart: "no"
+
+  postgres:
+    image: postgres:18.4-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
+      ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD:?copy .env.example to .env}
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD:?copy .env.example to .env}
+      INVENTORY_DB_PASSWORD: ${INVENTORY_DB_PASSWORD:?copy .env.example to .env}
+    volumes:
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      # Connects over TCP to a database the init script creates. During init,
+      # Postgres listens only on a local socket, so this passes only once init
+      # has finished and the real server is up.
+      test: ["CMD-SHELL", "PGPASSWORD=\"$$POSTGRES_PASSWORD\" psql -h 127.0.0.1 -U postgres -d inventory -tAc 'SELECT 1' > /dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:8.10.1-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  order:
+    build:
+      context: ../..
+      dockerfile: services/order/Dockerfile
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://order_svc:${ORDER_DB_PASSWORD}@postgres:5432/orders?sslmode=disable
+    ports:
+      - "8081:8081"
+    depends_on: *backend-depends
+    healthcheck:
+      <<: *service-healthcheck
+      test: ["CMD", "/order", "healthcheck"]
+
+  payment:
+    build:
+      context: ../..
+      dockerfile: services/payment/Dockerfile
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://payment_svc:${PAYMENT_DB_PASSWORD}@postgres:5432/payments?sslmode=disable
+    ports:
+      - "8082:8082"
+    depends_on: *backend-depends
+    healthcheck:
+      <<: *service-healthcheck
+      test: ["CMD", "/payment", "healthcheck"]
+
+  inventory:
+    build:
+      context: ../..
+      dockerfile: services/inventory/Dockerfile
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://inventory_svc:${INVENTORY_DB_PASSWORD}@postgres:5432/inventory?sslmode=disable
+      REDIS_ADDR: redis:6379
+    ports:
+      - "8083:8083"
+    depends_on:
+      <<: *backend-depends
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *service-healthcheck
+      test: ["CMD", "/inventory", "healthcheck"]
+
+  gateway:
+    build:
+      context: ../..
+      dockerfile: services/gateway/Dockerfile
+    environment:
+      ORDER_GRPC_ADDR: order:9001
+      PAYMENT_GRPC_ADDR: payment:9002
+      INVENTORY_GRPC_ADDR: inventory:9003
+      SHUTDOWN_TIMEOUT: 10s
+    ports:
+      - "8080:8080"
+    depends_on:
+      order:
+        condition: service_healthy
+      payment:
+        condition: service_healthy
+      inventory:
+        condition: service_healthy
+    healthcheck:
+      <<: *service-healthcheck
+      test: ["CMD", "/gateway", "healthcheck"]
+
+volumes:
+  postgres-data:
