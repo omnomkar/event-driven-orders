@@ -23,7 +23,7 @@ Alternative: have the order service look up prices over gRPC when the order is c
 ## 4. Kafka payloads are Protobuf
 
 Every topic carries one Protobuf wrapper message with a message ID, the order ID, a timestamp, and a `oneof` of the variants for that topic.
-The same `.proto` files define gRPC and events, so types are shared, payloads are compact, and `buf breaking` catches incompatible schema changes in CI.
+The same `.proto` files define gRPC and events, so types are shared and payloads are compact. CI already runs `buf lint` and fails if the committed generated code is out of date. Adding `buf breaking` to CI, so incompatible schema changes fail the build, is a planned next step.
 Alternative: JSON events. They are easier to read in a console, but they have no enforced schema, so a renamed field breaks consumers silently.
 
 ## 5. The saga is orchestrated by the order service
