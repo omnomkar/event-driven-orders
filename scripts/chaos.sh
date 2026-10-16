@@ -5,8 +5,15 @@
 #   1. Start the stack (make up) and place N orders concurrently through the
 #      gateway, all with the good test card and products with deep stock.
 #   2. As soon as the payment service has recorded its first charge for this
-#      run, kill its container (SIGKILL, no graceful shutdown) while it is
-#      still working through the rest, keep it down, then start it again.
+#      run, kill its container (SIGKILL, no graceful shutdown), keep it down,
+#      then start it again. The kill counts as mid-flow if any order was not
+#      final at that moment, in either (or both) of two ways:
+#        - not yet charged: its ChargePayment is consumed, or redelivered if
+#          it was in progress, after the restart;
+#        - charged but not yet confirmed: its PaymentSucceeded reaches the
+#          order service late, from payment's outbox if the relay had not
+#          published it before the kill.
+#      The run fails if every order was already final at the kill.
 #   3. Wait until every order is CONFIRMED or CANCELLED.
 #   4. Check in Postgres that every order is final, no order has more than
 #      one payment, successful payments equal confirmed orders, and no record
@@ -87,9 +94,19 @@ log "killing payment"
 "${compose[@]}" kill payment >&2
 kill_epoch=$(date +%s)
 kill_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-charged_at_kill=$(charges_since_start)
+# Snapshot the orders first: the order service keeps applying replies that
+# were already in Kafka, so these counts can only move toward final. The
+# payment counts are stable once payment is dead.
 at_kill=$(sql orders "SELECT status || '=' || count(*) FROM orders WHERE customer_id = '${run_id}' GROUP BY status ORDER BY status" | paste -sd ' ')
 in_flight=$(count_orders "AND status NOT IN ('CONFIRMED', 'CANCELLED')")
+confirmed_at_kill=$(count_orders "AND status = 'CONFIRMED'")
+charged_at_kill=$(charges_since_start)
+unpublished_at_kill=$(sql payments "SELECT count(*) FROM outbox WHERE sent_at IS NULL AND created_at >= '${run_start}'")
+uncharged_at_kill=$((accepted - charged_at_kill))
+charged_unconfirmed_at_kill=$((charged_at_kill - confirmed_at_kill))
+if [[ $charged_unconfirmed_at_kill -lt 0 ]]; then
+	charged_unconfirmed_at_kill=0
+fi
 log "orders at kill: ${at_kill} (${in_flight} not final)"
 
 sleep "$down_seconds"
@@ -138,8 +155,15 @@ check "$confirmed" "$accepted" "orders confirmed (good card, stock available)"
 check "$multi" 0 "orders with more than one payment"
 check "$succeeded" "$confirmed" "successful payments vs confirmed orders"
 check "$dlq_added" 0 "records added to dead-letter topics"
-if [[ $in_flight -eq 0 || $charged_at_kill -eq 0 || $charged_at_kill -ge $accepted ]]; then
-	failures+=("payment was not killed mid-run (${charged_at_kill} of ${accepted} charged); raise CHAOS_ORDERS")
+cases=()
+if [[ $uncharged_at_kill -gt 0 ]]; then
+	cases+=("not yet charged: ${uncharged_at_kill} order(s); their ChargePayment was handled after the restart")
+fi
+if [[ $charged_unconfirmed_at_kill -gt 0 ]]; then
+	cases+=("charged but not yet confirmed: ${charged_unconfirmed_at_kill} order(s); ${unpublished_at_kill} of their PaymentSucceeded replies were still in payment's outbox and were sent by the relay after the restart")
+fi
+if [[ $in_flight -eq 0 ]]; then
+	failures+=("every order was already final when payment was killed; raise CHAOS_ORDERS")
 fi
 result=PASS
 if [[ ${#failures[@]} -gt 0 ]]; then
@@ -158,6 +182,14 @@ mkdir -p scripts/results
 	echo "  orders at kill:                ${at_kill:-none}"
 	echo "  payments recorded at kill:     ${charged_at_kill}"
 	echo "  not final at kill:             ${in_flight}"
+	echo
+	echo "Mid-flow cases at the kill"
+	if [[ ${#cases[@]} -eq 0 ]]; then
+		echo "  none: every order was already final"
+	fi
+	for c in "${cases[@]}"; do
+		echo "  - ${c}"
+	done
 	echo
 	echo "Outcome"
 	echo "  all final within:              ${finish_seconds}s of restart"

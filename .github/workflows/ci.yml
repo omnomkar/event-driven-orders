@@ -145,10 +145,13 @@ jobs:
         run: make ready
 
       # Reuses the stack started above, so it adds about a minute instead of
-      # a second image build.
+      # a second image build. Runtime is dominated by payment's downtime, not
+      # the order count; enough orders are needed that payment is still
+      # charging when it is killed (30 was not enough on CI runners).
       - name: Chaos test (kill payment mid-run, expect exactly one charge per order)
         env:
-          CHAOS_ORDERS: "30"
+          CHAOS_ORDERS: "200"
+          CHAOS_CONCURRENCY: "20"
         run: make chaos
 
       - name: Show container status and logs on failure
