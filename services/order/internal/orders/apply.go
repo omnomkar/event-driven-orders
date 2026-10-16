@@ -10,6 +10,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/omnomkar/event-driven-orders/pkg/dedup"
 	"github.com/omnomkar/event-driven-orders/pkg/kafka"
 	"github.com/omnomkar/event-driven-orders/pkg/outbox"
 	eventsv1 "github.com/omnomkar/event-driven-orders/proto/gen/go/eventorders/events/v1"
@@ -24,26 +25,32 @@ type EventData struct {
 	Reason string
 }
 
-// Apply moves the order through the saga in response to e. In one
-// transaction it locks the order row, asks next() for the new status and
-// commands, updates the order, appends a history row, and writes every
-// command to the outbox. It returns the new status.
+// Apply moves the order through the saga in response to e, the reply with
+// ID messageID. In one transaction it records messageID as processed, locks
+// the order row, asks next() for the new status and commands, updates the
+// order, appends a history row, and writes every command to the outbox. It
+// returns the new status, or an error wrapping dedup.ErrDuplicate if the
+// reply was already applied.
 //
 // The row lock (SELECT ... FOR UPDATE) serializes concurrent events for the
 // same order, so two replies can never both act on the same old status.
-func (s *Store) Apply(ctx context.Context, orderID string, e Event, data EventData) (Status, error) {
+func (s *Store) Apply(ctx context.Context, messageID, orderID string, e Event, data EventData) (Status, error) {
 	var to Status
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := dedup.Claim(ctx, tx, messageID); err != nil {
+			return err
+		}
 		var (
-			from     Status
-			token    string
-			total    *int64
-			currency *string
+			from         Status
+			token        string
+			total        *int64
+			currency     *string
+			cancelReason *string
 		)
 		err := tx.QueryRow(ctx, `
-			SELECT status, payment_token, total_cents, currency
+			SELECT status, payment_token, total_cents, currency, cancel_reason
 			FROM orders WHERE id = $1 FOR UPDATE`, orderID,
-		).Scan(&from, &token, &total, &currency)
+		).Scan(&from, &token, &total, &currency, &cancelReason)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -60,23 +67,23 @@ func (s *Store) Apply(ctx context.Context, orderID string, e Event, data EventDa
 		if e == EventStockReserved {
 			total, currency = &data.TotalCents, &data.Currency
 		}
-		var reason *string
-		if to == StatusCancelled {
-			reason = &data.Reason
+		// The reason arrives with the failure (StockRejected or
+		// PaymentFailed). StockReleased carries none, so the reason stored
+		// when the order entered CANCELLING is kept.
+		if data.Reason != "" && (to == StatusCancelling || to == StatusCancelled) {
+			cancelReason = &data.Reason
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE orders
-			SET status = $2, total_cents = $3, currency = $4,
-			    cancel_reason = COALESCE($5, cancel_reason), updated_at = now()
-			WHERE id = $1`, orderID, to, total, currency, reason); err != nil {
+			SET status = $2, total_cents = $3, currency = $4, cancel_reason = $5, updated_at = now()
+			WHERE id = $1`, orderID, to, total, currency, cancelReason); err != nil {
 			return fmt.Errorf("update order: %w", err)
 		}
 		if err := recordStatus(ctx, tx, orderID, to); err != nil {
 			return err
 		}
-
 		for _, c := range cmds {
-			topic, msg, err := buildCommand(c, orderID, token, deref(total), deref(currency), data.Reason)
+			topic, msg, err := buildCommand(c, orderID, token, deref(total), deref(currency), deref(cancelReason))
 			if err != nil {
 				return err
 			}

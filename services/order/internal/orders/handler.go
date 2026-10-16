@@ -10,6 +10,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/omnomkar/event-driven-orders/pkg/dedup"
 	"github.com/omnomkar/event-driven-orders/pkg/kafka"
 	"github.com/omnomkar/event-driven-orders/pkg/logging"
 	eventsv1 "github.com/omnomkar/event-driven-orders/proto/gen/go/eventorders/events/v1"
@@ -30,16 +31,17 @@ type reply struct {
 // payment.events topics. It is the saga orchestrator's entry point.
 func (s *Store) SagaHandler(logger *slog.Logger) kafka.Handler {
 	return func(ctx context.Context, rec *kgo.Record) error {
-		r, skip, err := decodeReply(rec)
+		r, err := decodeReply(rec)
 		if err != nil {
 			return kafka.Permanent(err)
 		}
-		if skip {
-			return nil
-		}
 		log := logging.WithOrder(logger, r.orderID).With("message_id", r.messageID, "event", r.event.String())
 
-		to, err := s.Apply(ctx, r.orderID, r.event, r.data)
+		to, err := s.Apply(ctx, r.messageID, r.orderID, r.event, r.data)
+		if errors.Is(err, dedup.ErrDuplicate) {
+			log.Info("duplicate reply skipped")
+			return nil
+		}
 		if errors.Is(err, ErrInvalidTransition) || errors.Is(err, ErrNotFound) {
 			// Retrying cannot make the event valid for this order.
 			return kafka.Permanent(err)
@@ -52,36 +54,34 @@ func (s *Store) SagaHandler(logger *slog.Logger) kafka.Handler {
 	}
 }
 
-// decodeReply decodes rec into a saga reply. skip is true for messages the
-// saga does not act on.
-func decodeReply(rec *kgo.Record) (r reply, skip bool, err error) {
+// decodeReply decodes rec into a saga reply.
+func decodeReply(rec *kgo.Record) (r reply, err error) {
 	switch rec.Topic {
 	case kafka.TopicInventoryEvents:
 		var ev eventsv1.InventoryEvent
 		if err := proto.Unmarshal(rec.Value, &ev); err != nil {
-			return r, false, fmt.Errorf("decode inventory event: %w", err)
+			return r, fmt.Errorf("decode inventory event: %w", err)
 		}
 		r.orderID, r.messageID = ev.GetOrderId(), ev.GetMessageId()
 		switch e := ev.GetEvent().(type) {
 		case *eventsv1.InventoryEvent_StockReserved:
 			total, currency := e.StockReserved.GetTotalCents(), e.StockReserved.GetCurrency()
 			if total <= 0 || len(currency) != 3 {
-				return r, false, fmt.Errorf("StockReserved for order %s has invalid total %d %q", r.orderID, total, currency)
+				return r, fmt.Errorf("StockReserved for order %s has invalid total %d %q", r.orderID, total, currency)
 			}
 			r.event, r.data = EventStockReserved, EventData{TotalCents: total, Currency: currency}
 		case *eventsv1.InventoryEvent_StockRejected:
 			r.event, r.data = EventStockRejected, EventData{Reason: e.StockRejected.GetReason()}
 		case *eventsv1.InventoryEvent_StockReleased:
-			// The order was already cancelled when the release was sent.
-			return r, true, nil
+			r.event = EventStockReleased
 		default:
-			return r, false, fmt.Errorf("unknown inventory event %T", e)
+			return r, fmt.Errorf("unknown inventory event %T", e)
 		}
 
 	case kafka.TopicPaymentEvents:
 		var ev eventsv1.PaymentEvent
 		if err := proto.Unmarshal(rec.Value, &ev); err != nil {
-			return r, false, fmt.Errorf("decode payment event: %w", err)
+			return r, fmt.Errorf("decode payment event: %w", err)
 		}
 		r.orderID, r.messageID = ev.GetOrderId(), ev.GetMessageId()
 		switch e := ev.GetEvent().(type) {
@@ -90,14 +90,18 @@ func decodeReply(rec *kgo.Record) (r reply, skip bool, err error) {
 		case *eventsv1.PaymentEvent_PaymentFailed:
 			r.event, r.data = EventPaymentFailed, EventData{Reason: e.PaymentFailed.GetReason()}
 		default:
-			return r, false, fmt.Errorf("unknown payment event %T", e)
+			return r, fmt.Errorf("unknown payment event %T", e)
 		}
 
 	default:
-		return r, false, fmt.Errorf("saga does not consume topic %q", rec.Topic)
+		return r, fmt.Errorf("saga does not consume topic %q", rec.Topic)
 	}
 	if _, err := uuid.Parse(r.orderID); err != nil {
-		return r, false, fmt.Errorf("saga reply has invalid order_id %q", r.orderID)
+		return r, fmt.Errorf("saga reply has invalid order_id %q", r.orderID)
 	}
-	return r, false, nil
+	if r.messageID == "" {
+		// Without an ID the reply cannot be deduplicated.
+		return r, fmt.Errorf("saga reply for order %s has no message_id", r.orderID)
+	}
+	return r, nil
 }

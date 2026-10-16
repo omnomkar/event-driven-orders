@@ -40,9 +40,10 @@ func (f *fakePayments) TokenizeCard(_ context.Context, _ *paymentv1.TokenizeCard
 
 type fakeOrders struct {
 	orderv1.OrderServiceClient
-	created *orderv1.CreateOrderRequest
-	order   *orderv1.Order
-	err     error
+	created  *orderv1.CreateOrderRequest
+	order    *orderv1.Order
+	replayed bool
+	err      error
 }
 
 func (f *fakeOrders) CreateOrder(_ context.Context, in *orderv1.CreateOrderRequest, _ ...grpc.CallOption) (*orderv1.CreateOrderResponse, error) {
@@ -50,7 +51,7 @@ func (f *fakeOrders) CreateOrder(_ context.Context, in *orderv1.CreateOrderReque
 	return &orderv1.CreateOrderResponse{Order: &orderv1.Order{
 		OrderId: "0192f5d1-0000-7000-8000-000000000001", CustomerId: in.GetCustomerId(),
 		Status: orderv1.OrderStatus_ORDER_STATUS_PENDING, Items: in.GetItems(),
-	}}, f.err
+	}, Replayed: f.replayed}, f.err
 }
 
 func (f *fakeOrders) GetOrder(_ context.Context, _ *orderv1.GetOrderRequest, _ ...grpc.CallOption) (*orderv1.GetOrderResponse, error) {
@@ -167,6 +168,7 @@ func TestBackendErrorsMapToHTTP(t *testing.T) {
 	}{
 		{"invalid card", status.Error(codes.InvalidArgument, "card number is not valid"), nil, http.StatusBadRequest},
 		{"invalid order", nil, status.Error(codes.InvalidArgument, "invalid order: too many items"), http.StatusBadRequest},
+		{"idempotency key reused", nil, status.Error(codes.AlreadyExists, "idempotency key was already used with a different request"), http.StatusConflict},
 		{"order service down", nil, status.Error(codes.Unavailable, "connection refused"), http.StatusServiceUnavailable},
 		{"internal", nil, status.Error(codes.Internal, "boom"), http.StatusInternalServerError},
 	}
@@ -182,6 +184,20 @@ func TestBackendErrorsMapToHTTP(t *testing.T) {
 				t.Error("internal error detail leaked to the client")
 			}
 		})
+	}
+}
+
+// A repeated request with the same Idempotency-Key gets the original order
+// with 200 instead of 202, since nothing new was accepted.
+func TestCreateOrderReplayReturns200(t *testing.T) {
+	h := newHarness()
+	h.orders.replayed = true
+	rec := h.do("POST", "/orders", validOrder, map[string]string{"Idempotency-Key": "key-1"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200; body %s", rec.Code, rec.Body)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/orders/0192f5d1-0000-7000-8000-000000000001" {
+		t.Errorf("Location = %q", loc)
 	}
 }
 

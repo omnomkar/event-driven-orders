@@ -4,13 +4,17 @@ package orders
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -31,7 +35,14 @@ var (
 	// ErrInvalid means the request failed validation. The wrapped message
 	// says why and is safe to show to the client.
 	ErrInvalid = errors.New("invalid order")
+	// ErrIdempotencyConflict means the customer already used the idempotency
+	// key for a request with different items.
+	ErrIdempotencyConflict = errors.New("idempotency key was already used with a different request")
 )
+
+// idempotencyConstraint is the unique constraint on (customer_id,
+// idempotency_key), created by migration 00002.
+const idempotencyConstraint = "orders_customer_idempotency_key"
 
 // Item is one product and quantity in an order.
 type Item struct {
@@ -104,10 +115,61 @@ func (p CreateParams) validate() error {
 // items, its first history row, the ReserveStock command, and the
 // OrderCreated event are all written in one transaction: either all of them
 // are stored or none are.
-func (s *Store) Create(ctx context.Context, p CreateParams) (*Order, error) {
+//
+// If p has an idempotency key that the customer already used, nothing new is
+// created. With the same items, Create returns the original order and
+// replayed is true; with different items it returns ErrIdempotencyConflict.
+// Concurrent requests with the same key are decided by the unique
+// constraint: one insert wins, and the others wait for it, fail, and read
+// the winner's order.
+func (s *Store) Create(ctx context.Context, p CreateParams) (o *Order, replayed bool, err error) {
 	if err := p.validate(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	var hash *string
+	if p.IdempotencyKey != "" {
+		h := requestHash(p.Items)
+		hash = &h
+	}
+	o, err = s.insert(ctx, p, hash)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation && pgErr.ConstraintName == idempotencyConstraint {
+		return s.replay(ctx, p.CustomerID, p.IdempotencyKey, *hash)
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("create order: %w", err)
+	}
+	return o, false, nil
+}
+
+// pgUniqueViolation is the Postgres error code for a unique constraint
+// violation.
+const pgUniqueViolation = "23505"
+
+// replay returns the order the customer created earlier with key, if it was
+// created from the same items.
+func (s *Store) replay(ctx context.Context, customerID, key, hash string) (*Order, bool, error) {
+	var (
+		id         string
+		storedHash *string
+	)
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, request_hash FROM orders WHERE customer_id = $1 AND idempotency_key = $2`,
+		customerID, key).Scan(&id, &storedHash)
+	if err != nil {
+		return nil, false, fmt.Errorf("look up order for idempotency key: %w", err)
+	}
+	if storedHash == nil || *storedHash != hash {
+		return nil, false, ErrIdempotencyConflict
+	}
+	o, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, false, err
+	}
+	return o, true, nil
+}
+
+func (s *Store) insert(ctx context.Context, p CreateParams, hash *string) (*Order, error) {
 	// UUIDv7 IDs start with a timestamp, so new rows land at the end of the
 	// primary key index instead of at random places in it.
 	id, err := uuid.NewV7()
@@ -121,20 +183,16 @@ func (s *Store) Create(ctx context.Context, p CreateParams) (*Order, error) {
 		Items:        p.Items,
 		PaymentToken: p.PaymentToken,
 	}
-
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `
-			INSERT INTO orders (id, customer_id, status, payment_token, idempotency_key)
-			VALUES ($1, $2, $3, $4, $5)
+			INSERT INTO orders (id, customer_id, status, payment_token, idempotency_key, request_hash)
+			VALUES ($1, $2, $3, $4, $5, $6)
 			RETURNING created_at, updated_at`,
-			o.ID, o.CustomerID, o.Status, o.PaymentToken, nullIfEmpty(p.IdempotencyKey),
+			o.ID, o.CustomerID, o.Status, o.PaymentToken, nullIfEmpty(p.IdempotencyKey), hash,
 		).Scan(&o.CreatedAt, &o.UpdatedAt)
 		if err != nil {
-			// TODO(stage 3): on a duplicate idempotency_key, return the
-			// existing order instead of an error.
 			return fmt.Errorf("insert order: %w", err)
 		}
-
 		productIDs := make([]string, len(o.Items))
 		quantities := make([]int32, len(o.Items))
 		for i, it := range o.Items {
@@ -178,9 +236,26 @@ func (s *Store) Create(ctx context.Context, p CreateParams) (*Order, error) {
 		})
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create order: %w", err)
+		return nil, err
 	}
 	return o, nil
+}
+
+// requestHash fingerprints an order's items for idempotency checks. Items are
+// sorted first, so listing the same items in another order is the same
+// request. Card details are deliberately left out: the payment token changes
+// on every request, and no value derived from a card number is stored
+// outside the payment service.
+func requestHash(items []Item) string {
+	sorted := slices.Clone(items)
+	slices.SortFunc(sorted, func(a, b Item) int { return strings.Compare(a.ProductID, b.ProductID) })
+	h := sha256.New()
+	for _, it := range sorted {
+		// Length-prefixing the ID keeps the encoding unambiguous. Writes to
+		// a hash never fail.
+		_, _ = fmt.Fprintf(h, "%d:%s:%d;", len(it.ProductID), it.ProductID, it.Quantity)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Get returns the order with its items, or ErrNotFound.

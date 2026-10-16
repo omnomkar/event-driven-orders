@@ -11,9 +11,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/omnomkar/event-driven-orders/pkg/dedup"
 	"github.com/omnomkar/event-driven-orders/pkg/kafka"
 	"github.com/omnomkar/event-driven-orders/pkg/outbox"
 	eventsv1 "github.com/omnomkar/event-driven-orders/proto/gen/go/eventorders/events/v1"
@@ -30,7 +32,13 @@ var (
 	ErrMixedCurrency = errors.New("products in one order must share a currency")
 	// ErrInvalidLine means a reservation line has no product or a non-positive quantity.
 	ErrInvalidLine = errors.New("invalid reservation line")
+	// ErrAlreadyReserved means the order already has a reservation.
+	ErrAlreadyReserved = errors.New("order already has a reservation")
 )
+
+// pgUniqueViolation is the Postgres error code for a unique constraint
+// violation.
+const pgUniqueViolation = "23505"
 
 // Product is one catalog entry with its current stock.
 type Product struct {
@@ -71,30 +79,46 @@ func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-// Reserve reserves every line for orderID, or none of them, in one
-// transaction. On success it also writes StockReserved (with unit prices and
-// the total) to the outbox in that same transaction.
+// Rejection explains why an order could not be reserved. Its reason ends up
+// as the order's cancel reason, so it names the product but never the stock
+// level.
+type Rejection struct {
+	ProductID string
+	Reason    string
+	Err       error // one of the rejection sentinels above
+}
+
+// Reserve handles the ReserveStock command with ID messageID. In one
+// transaction it records the message as processed and then either reserves
+// every line for orderID or none of them:
+//
+//   - reserved: stock is decremented, the reservation is stored, and
+//     StockReserved (with unit prices and the total) goes to the outbox;
+//   - rejected: nothing changes except that StockRejected goes to the
+//     outbox, and the returned Rejection says why.
+//
+// Exactly one of the two results is non-nil when err is nil. A redelivered
+// command returns an error wrapping dedup.ErrDuplicate.
 //
 // The product rows are locked with SELECT ... FOR UPDATE in product ID order.
 // Two orders that share products therefore always take their locks in the
 // same order, so neither can hold a lock the other is waiting for, and they
 // can never deadlock. The lock also means two orders cannot both read the
 // same "available" value and oversell it.
-func (s *Store) Reserve(ctx context.Context, orderID string, lines []Line) (*Reservation, error) {
-	if len(lines) == 0 {
-		return nil, fmt.Errorf("%w: no lines", ErrInvalidLine)
-	}
-	ids := make([]string, len(lines))
-	for i, l := range lines {
-		if strings.TrimSpace(l.ProductID) == "" || l.Quantity <= 0 {
-			return nil, fmt.Errorf("%w: line %d", ErrInvalidLine, i)
-		}
-		ids[i] = l.ProductID
-	}
-	slices.Sort(ids)
-
-	var res *Reservation
+func (s *Store) Reserve(ctx context.Context, messageID, orderID string, lines []Line) (*Reservation, *Rejection, error) {
+	var (
+		res *Reservation
+		rej *Rejection
+	)
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := dedup.Claim(ctx, tx, messageID); err != nil {
+			return err
+		}
+		ids := make([]string, len(lines))
+		for i, l := range lines {
+			ids[i] = l.ProductID
+		}
+		slices.Sort(ids)
 		rows, err := tx.Query(ctx, `
 			SELECT id, name, unit_price_cents, currency, available
 			FROM products
@@ -114,29 +138,28 @@ func (s *Store) Reserve(ctx context.Context, orderID string, lines []Line) (*Res
 		}
 
 		// Check every line before changing anything: all or nothing.
-		// TODO(stage 3): instead of returning these errors, write a
-		// StockRejected event to the outbox so the order is cancelled.
-		r := &Reservation{OrderID: orderID}
-		for _, l := range lines {
-			p, ok := byID[l.ProductID]
-			switch {
-			case !ok:
-				return fmt.Errorf("%w: %s", ErrUnknownProduct, l.ProductID)
-			case p.Available < l.Quantity:
-				return fmt.Errorf("%w: %s has %d, order wants %d", ErrInsufficientStock, p.ID, p.Available, l.Quantity)
-			case r.Currency != "" && p.Currency != r.Currency:
-				return fmt.Errorf("%w: %s is in %s", ErrMixedCurrency, p.ID, p.Currency)
-			}
-			r.Currency = p.Currency
-			r.Lines = append(r.Lines, PricedLine{Line: l, UnitPriceCents: p.UnitPriceCents})
-			r.TotalCents += p.UnitPriceCents * int64(l.Quantity)
+		var r *Reservation
+		if r, rej = price(orderID, lines, byID); rej != nil {
+			return outbox.Add(ctx, tx, kafka.TopicInventoryEvents, orderID, &eventsv1.InventoryEvent{
+				MessageId: uuid.NewString(),
+				OrderId:   orderID,
+				CreatedAt: timestamppb.Now(),
+				Event: &eventsv1.InventoryEvent_StockRejected{
+					StockRejected: &eventsv1.StockRejected{Reason: rej.Reason, ProductId: rej.ProductID},
+				},
+			})
 		}
 
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO reservations (order_id, status, total_cents, currency)
 			VALUES ($1, 'RESERVED', $2, $3)`, orderID, r.TotalCents, r.Currency); err != nil {
-			// TODO(stage 3): a redelivered ReserveStock hits this primary key;
-			// consumer dedup by message_id will skip it before it gets here.
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+				// A second ReserveStock for the same order under a different
+				// message_id. Redeliveries never get here (dedup skips them),
+				// so this is a bug upstream, not something to retry.
+				return fmt.Errorf("%w: order %s", ErrAlreadyReserved, orderID)
+			}
 			return fmt.Errorf("insert reservation: %w", err)
 		}
 		for _, l := range r.Lines {
@@ -170,9 +193,110 @@ func (s *Store) Reserve(ctx context.Context, orderID string, lines []Line) (*Res
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("reserve stock for order %s: %w", orderID, err)
+		return nil, nil, fmt.Errorf("reserve stock for order %s: %w", orderID, err)
 	}
-	return res, nil
+	return res, rej, nil
+}
+
+// price checks every line against the locked products and prices the order.
+// It returns a Rejection for the first line that cannot be reserved.
+func price(orderID string, lines []Line, byID map[string]Product) (*Reservation, *Rejection) {
+	reject := func(productID string, sentinel error) *Rejection {
+		reason := sentinel.Error()
+		if productID != "" {
+			reason += ": " + productID
+		}
+		return &Rejection{ProductID: productID, Reason: reason, Err: sentinel}
+	}
+	if len(lines) == 0 {
+		return nil, reject("", ErrInvalidLine)
+	}
+	r := &Reservation{OrderID: orderID}
+	for _, l := range lines {
+		if strings.TrimSpace(l.ProductID) == "" || l.Quantity <= 0 {
+			return nil, reject(l.ProductID, ErrInvalidLine)
+		}
+		p, ok := byID[l.ProductID]
+		switch {
+		case !ok:
+			return nil, reject(l.ProductID, ErrUnknownProduct)
+		case p.Available < l.Quantity:
+			return nil, reject(l.ProductID, ErrInsufficientStock)
+		case r.Currency != "" && p.Currency != r.Currency:
+			return nil, reject(l.ProductID, ErrMixedCurrency)
+		}
+		r.Currency = p.Currency
+		r.Lines = append(r.Lines, PricedLine{Line: l, UnitPriceCents: p.UnitPriceCents})
+		r.TotalCents += p.UnitPriceCents * int64(l.Quantity)
+	}
+	return r, nil
+}
+
+// ReleaseResult says what Release found.
+type ReleaseResult string
+
+const (
+	Released        ReleaseResult = "released"
+	AlreadyReleased ReleaseResult = "already_released"
+	NoReservation   ReleaseResult = "no_reservation"
+)
+
+// Release handles the ReleaseStock command with ID messageID: it gives the
+// order's reserved stock back and marks the reservation RELEASED, in one
+// transaction with the dedup record and a StockReleased reply.
+//
+// Release is idempotent. If the reservation is already released, or was
+// never made, nothing changes but StockReleased is still sent, so the saga
+// can always finish cancelling the order.
+func (s *Store) Release(ctx context.Context, messageID, orderID string) (ReleaseResult, error) {
+	var result ReleaseResult
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := dedup.Claim(ctx, tx, messageID); err != nil {
+			return err
+		}
+		var status string
+		err := tx.QueryRow(ctx, `SELECT status FROM reservations WHERE order_id = $1 FOR UPDATE`, orderID).Scan(&status)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			result = NoReservation
+		case err != nil:
+			return fmt.Errorf("lock reservation: %w", err)
+		case status == "RELEASED":
+			result = AlreadyReleased
+		default:
+			result = Released
+			// Lock the products in ID order, the same order Reserve uses, so
+			// a release and a reservation cannot deadlock.
+			if _, err := tx.Exec(ctx, `
+				SELECT 1 FROM products
+				WHERE id IN (SELECT product_id FROM reservation_lines WHERE order_id = $1)
+				ORDER BY id
+				FOR UPDATE`, orderID); err != nil {
+				return fmt.Errorf("lock products: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE products p
+				SET available = p.available + rl.quantity, updated_at = now()
+				FROM reservation_lines rl
+				WHERE rl.order_id = $1 AND p.id = rl.product_id`, orderID); err != nil {
+				return fmt.Errorf("restore stock: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE reservations SET status = 'RELEASED', updated_at = now() WHERE order_id = $1`, orderID); err != nil {
+				return fmt.Errorf("mark reservation released: %w", err)
+			}
+		}
+		return outbox.Add(ctx, tx, kafka.TopicInventoryEvents, orderID, &eventsv1.InventoryEvent{
+			MessageId: uuid.NewString(),
+			OrderId:   orderID,
+			CreatedAt: timestamppb.Now(),
+			Event:     &eventsv1.InventoryEvent_StockReleased{StockReleased: &eventsv1.StockReleased{}},
+		})
+	})
+	if err != nil {
+		return "", fmt.Errorf("release stock for order %s: %w", orderID, err)
+	}
+	return result, nil
 }
 
 // GetProduct returns one product, or ErrNotFound.

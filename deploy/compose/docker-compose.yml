@@ -6,6 +6,10 @@
 
 name: eventorders
 
+# The four application services set pull_policy: build, so any compose client
+# (including the end-to-end tests) rebuilds their images from source instead
+# of reusing a stale local image.
+
 x-service-env: &service-env
   KAFKA_BROKERS: kafka:9092
   SHUTDOWN_TIMEOUT: 10s
@@ -101,6 +105,7 @@ services:
     build:
       context: ../..
       dockerfile: services/order/Dockerfile
+    pull_policy: build
     environment:
       <<: *service-env
       DATABASE_URL: postgres://order_svc:${ORDER_DB_PASSWORD}@postgres:5432/orders?sslmode=disable
@@ -115,6 +120,7 @@ services:
     build:
       context: ../..
       dockerfile: services/payment/Dockerfile
+    pull_policy: build
     environment:
       <<: *service-env
       DATABASE_URL: postgres://payment_svc:${PAYMENT_DB_PASSWORD}@postgres:5432/payments?sslmode=disable
@@ -129,6 +135,7 @@ services:
     build:
       context: ../..
       dockerfile: services/inventory/Dockerfile
+    pull_policy: build
     environment:
       <<: *service-env
       DATABASE_URL: postgres://inventory_svc:${INVENTORY_DB_PASSWORD}@postgres:5432/inventory?sslmode=disable
@@ -147,6 +154,7 @@ services:
     build:
       context: ../..
       dockerfile: services/gateway/Dockerfile
+    pull_policy: build
     environment:
       ORDER_GRPC_ADDR: order:9001
       PAYMENT_GRPC_ADDR: payment:9002

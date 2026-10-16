@@ -18,13 +18,17 @@ func TestNext(t *testing.T) {
 		{"reserved charges payment", StatusPending, EventStockReserved, StatusInventoryReserved, []Command{CommandChargePayment}, false},
 		{"rejected cancels without compensation", StatusPending, EventStockRejected, StatusCancelled, []Command{CommandPublishCancelled}, false},
 		{"payment success confirms", StatusInventoryReserved, EventPaymentSucceeded, StatusConfirmed, []Command{CommandPublishConfirmed}, false},
-		{"payment failure releases stock then cancels", StatusInventoryReserved, EventPaymentFailed, StatusCancelled, []Command{CommandReleaseStock, CommandPublishCancelled}, false},
+		{"payment failure releases stock", StatusInventoryReserved, EventPaymentFailed, StatusCancelling, []Command{CommandReleaseStock}, false},
+		{"release confirmed cancels", StatusCancelling, EventStockReleased, StatusCancelled, []Command{CommandPublishCancelled}, false},
 
 		// Events that arrive in the wrong state are rejected and change nothing.
 		{"payment before reservation", StatusPending, EventPaymentSucceeded, StatusPending, nil, true},
 		{"duplicate StockReserved", StatusInventoryReserved, EventStockReserved, StatusInventoryReserved, nil, true},
 		{"confirmed is final", StatusConfirmed, EventPaymentFailed, StatusConfirmed, nil, true},
 		{"cancelled is final", StatusCancelled, EventStockReserved, StatusCancelled, nil, true},
+		{"duplicate StockReleased after cancel", StatusCancelled, EventStockReleased, StatusCancelled, nil, true},
+		{"payment success while cancelling", StatusCancelling, EventPaymentSucceeded, StatusCancelling, nil, true},
+		{"release without a failed payment", StatusInventoryReserved, EventStockReleased, StatusInventoryReserved, nil, true},
 		{"unknown status", Status("SHIPPED"), EventStockReserved, Status("SHIPPED"), nil, true},
 	}
 	for _, tt := range tests {
@@ -57,5 +61,25 @@ func TestNextHappyPath(t *testing.T) {
 	}
 	if s != StatusConfirmed {
 		t.Errorf("final status %s, want %s", s, StatusConfirmed)
+	}
+}
+
+// The compensation path: a failed payment releases stock before cancelling.
+func TestNextCompensationPath(t *testing.T) {
+	s := StatusPending
+	var sent []Command
+	for _, e := range []Event{EventStockReserved, EventPaymentFailed, EventStockReleased} {
+		var (
+			cmds []Command
+			err  error
+		)
+		if s, cmds, err = next(s, e); err != nil {
+			t.Fatalf("%s: %v", e, err)
+		}
+		sent = append(sent, cmds...)
+	}
+	want := []Command{CommandChargePayment, CommandReleaseStock, CommandPublishCancelled}
+	if s != StatusCancelled || !slices.Equal(sent, want) {
+		t.Errorf("final status %s, commands %v; want CANCELLED after %v", s, sent, want)
 	}
 }

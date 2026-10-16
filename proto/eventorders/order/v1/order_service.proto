@@ -17,6 +17,9 @@ enum OrderStatus {
   ORDER_STATUS_INVENTORY_RESERVED = 2;
   ORDER_STATUS_CONFIRMED = 3;
   ORDER_STATUS_CANCELLED = 4;
+  // Payment failed and the reserved stock is being released. The order moves
+  // to CANCELLED once inventory confirms the release.
+  ORDER_STATUS_CANCELLING = 5;
 }
 
 message Order {
@@ -38,12 +41,17 @@ message CreateOrderRequest {
   repeated eventorders.common.v1.LineItem items = 2;
   // Opaque token from PaymentService.TokenizeCard. Never a card number.
   string payment_token = 3;
-  // Repeating a request with the same key returns the original order.
+  // Optional, scoped to customer_id. Repeating a request with the same key and
+  // the same items returns the original order; the same key with different
+  // items fails with ALREADY_EXISTS.
   string idempotency_key = 4;
 }
 
 message CreateOrderResponse {
   Order order = 1;
+  // True when the idempotency key matched an earlier request with the same
+  // items, so this is that earlier order and nothing new was created.
+  bool replayed = 2;
 }
 
 message GetOrderRequest {

@@ -12,8 +12,11 @@ type Status string
 const (
 	StatusPending           Status = "PENDING"
 	StatusInventoryReserved Status = "INVENTORY_RESERVED"
-	StatusConfirmed         Status = "CONFIRMED"
-	StatusCancelled         Status = "CANCELLED"
+	// StatusCancelling means payment failed and the saga is waiting for
+	// inventory to confirm that the reserved stock was released.
+	StatusCancelling Status = "CANCELLING"
+	StatusConfirmed  Status = "CONFIRMED"
+	StatusCancelled  Status = "CANCELLED"
 )
 
 // Event is a saga reply the order service reacts to.
@@ -24,6 +27,7 @@ const (
 	EventStockRejected
 	EventPaymentSucceeded
 	EventPaymentFailed
+	EventStockReleased
 )
 
 func (e Event) String() string {
@@ -36,6 +40,8 @@ func (e Event) String() string {
 		return "PaymentSucceeded"
 	case EventPaymentFailed:
 		return "PaymentFailed"
+	case EventStockReleased:
+		return "StockReleased"
 	}
 	return fmt.Sprintf("Event(%d)", int(e))
 }
@@ -72,8 +78,12 @@ var transitions = map[Status]map[Event]transition{
 	},
 	StatusInventoryReserved: {
 		EventPaymentSucceeded: {to: StatusConfirmed, commands: []Command{CommandPublishConfirmed}},
-		// Compensate the completed reservation step before cancelling.
-		EventPaymentFailed: {to: StatusCancelled, commands: []Command{CommandReleaseStock, CommandPublishCancelled}},
+		// Compensate the completed reservation step. The order is cancelled
+		// only once inventory confirms the stock is back.
+		EventPaymentFailed: {to: StatusCancelling, commands: []Command{CommandReleaseStock}},
+	},
+	StatusCancelling: {
+		EventStockReleased: {to: StatusCancelled, commands: []Command{CommandPublishCancelled}},
 	},
 	// CONFIRMED and CANCELLED are final: no event moves an order out of them.
 }

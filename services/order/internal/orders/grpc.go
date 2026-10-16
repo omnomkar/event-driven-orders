@@ -33,7 +33,7 @@ func (s *Server) CreateOrder(ctx context.Context, req *orderv1.CreateOrderReques
 	for i, it := range req.GetItems() {
 		items[i] = Item{ProductID: it.GetProductId(), Quantity: it.GetQuantity()}
 	}
-	o, err := s.store.Create(ctx, CreateParams{
+	o, replayed, err := s.store.Create(ctx, CreateParams{
 		CustomerID:     req.GetCustomerId(),
 		Items:          items,
 		PaymentToken:   req.GetPaymentToken(),
@@ -42,8 +42,13 @@ func (s *Server) CreateOrder(ctx context.Context, req *orderv1.CreateOrderReques
 	if err != nil {
 		return nil, s.toStatus(err)
 	}
-	logging.WithOrder(s.logger, o.ID).Info("order created", "status", o.Status, "items", len(o.Items))
-	return &orderv1.CreateOrderResponse{Order: toProto(o)}, nil
+	log := logging.WithOrder(s.logger, o.ID)
+	if replayed {
+		log.Info("idempotent replay, returning existing order", "status", o.Status)
+	} else {
+		log.Info("order created", "status", o.Status, "items", len(o.Items))
+	}
+	return &orderv1.CreateOrderResponse{Order: toProto(o), Replayed: replayed}, nil
 }
 
 // GetOrder returns the order's current state.
@@ -63,6 +68,8 @@ func (s *Server) toStatus(err error) error {
 		return status.Error(codes.InvalidArgument, err.Error())
 	case errors.Is(err, ErrNotFound):
 		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, ErrIdempotencyConflict):
+		return status.Error(codes.AlreadyExists, err.Error())
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return status.FromContextError(err).Err()
 	}
@@ -73,6 +80,7 @@ func (s *Server) toStatus(err error) error {
 var statusToProto = map[Status]orderv1.OrderStatus{
 	StatusPending:           orderv1.OrderStatus_ORDER_STATUS_PENDING,
 	StatusInventoryReserved: orderv1.OrderStatus_ORDER_STATUS_INVENTORY_RESERVED,
+	StatusCancelling:        orderv1.OrderStatus_ORDER_STATUS_CANCELLING,
 	StatusConfirmed:         orderv1.OrderStatus_ORDER_STATUS_CONFIRMED,
 	StatusCancelled:         orderv1.OrderStatus_ORDER_STATUS_CANCELLED,
 }

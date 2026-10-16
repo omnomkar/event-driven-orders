@@ -10,9 +10,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/omnomkar/event-driven-orders/pkg/dedup"
 	"github.com/omnomkar/event-driven-orders/pkg/kafka"
 	"github.com/omnomkar/event-driven-orders/pkg/outbox"
 	eventsv1 "github.com/omnomkar/event-driven-orders/proto/gen/go/eventorders/events/v1"
@@ -20,11 +22,13 @@ import (
 )
 
 var (
-	// ErrUnknownToken means a charge named a token that was never issued.
-	ErrUnknownToken = errors.New("unknown payment token")
-	// ErrInvalidCharge means the amount or currency is not usable.
-	ErrInvalidCharge = errors.New("invalid charge")
+	// ErrAlreadyCharged means the order already has a payment.
+	ErrAlreadyCharged = errors.New("order already has a payment")
 )
+
+// pgUniqueViolation is the Postgres error code for a unique constraint
+// violation.
+const pgUniqueViolation = "23505"
 
 // Card is a tokenized card: everything the service keeps about it.
 type Card struct {
@@ -33,13 +37,21 @@ type Card struct {
 	Brand string
 }
 
-// Payment is a recorded charge.
+// Payment statuses, as stored in payments.status.
+const (
+	StatusSucceeded = "SUCCEEDED"
+	StatusFailed    = "FAILED"
+)
+
+// Payment is the outcome of a charge.
 type Payment struct {
-	ID          string
-	OrderID     string
-	AmountCents int64
-	Currency    string
-	Status      string
+	// ID is empty when the charge failed before a payment could be recorded.
+	ID            string
+	OrderID       string
+	AmountCents   int64
+	Currency      string
+	Status        string
+	FailureReason string
 }
 
 // Store reads and writes the payment service's own database.
@@ -76,50 +88,85 @@ func (s *Store) Tokenize(ctx context.Context, number string, expMonth, expYear i
 	return &Card{Token: token, Last4: d.Last4, Brand: d.Brand}, nil
 }
 
-// Charge simulates charging token for an order. The payment row and the
-// PaymentSucceeded event are written in one transaction.
-func (s *Store) Charge(ctx context.Context, orderID, token string, amountCents int64, currency string) (*Payment, error) {
-	if amountCents <= 0 || len(currency) != 3 {
-		return nil, fmt.Errorf("%w: amount %d %q", ErrInvalidCharge, amountCents, currency)
-	}
+// Reasons a charge fails. They become the order's cancel reason.
+const (
+	ReasonDeclined      = "card declined"
+	ReasonUnknownToken  = "unknown payment token"
+	ReasonInvalidAmount = "invalid charge amount"
+)
+
+// Charge handles the ChargePayment command with ID messageID: it simulates
+// charging token for an order. In one transaction it records the message as
+// processed, stores the payment, and writes the reply to the outbox:
+//
+//   - a normal card: a SUCCEEDED payment and PaymentSucceeded;
+//   - the decline test card: a FAILED payment and PaymentFailed;
+//   - an unknown token or an unusable amount: no payment row (there is
+//     nothing valid to record) but still PaymentFailed, so the saga releases
+//     the stock instead of waiting forever.
+//
+// A redelivered command returns an error wrapping dedup.ErrDuplicate. The
+// unique payments.order_id is a second guard: a different ChargePayment for
+// an order that already has a payment returns ErrAlreadyCharged.
+func (s *Store) Charge(ctx context.Context, messageID, orderID, token string, amountCents int64, currency string) (*Payment, error) {
 	id, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("generate payment id: %w", err)
 	}
-	p := &Payment{ID: id.String(), OrderID: orderID, AmountCents: amountCents, Currency: currency, Status: "SUCCEEDED"}
+	p := &Payment{OrderID: orderID, AmountCents: amountCents, Currency: currency}
 
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		var alwaysDecline bool
-		err := tx.QueryRow(ctx, `SELECT always_decline FROM cards WHERE token = $1`, token).Scan(&alwaysDecline)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrUnknownToken
+		if err := dedup.Claim(ctx, tx, messageID); err != nil {
+			return err
 		}
-		if err != nil {
-			return fmt.Errorf("look up card: %w", err)
+		p.Status, p.FailureReason = StatusFailed, ""
+		switch alwaysDecline, err := s.lookupCard(ctx, tx, token); {
+		case amountCents <= 0 || len(currency) != 3:
+			p.FailureReason = ReasonInvalidAmount
+		case errors.Is(err, pgx.ErrNoRows):
+			p.FailureReason = ReasonUnknownToken
+		case err != nil:
+			return err
+		case alwaysDecline:
+			p.ID, p.FailureReason = id.String(), ReasonDeclined
+		default:
+			p.ID, p.Status = id.String(), StatusSucceeded
 		}
-		// TODO(stage 3): when alwaysDecline is set, record a FAILED payment
-		// and emit PaymentFailed instead. Every charge succeeds for now.
-		_ = alwaysDecline
 
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO payments (id, order_id, token, amount_cents, currency, status)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			p.ID, orderID, token, amountCents, currency, p.Status); err != nil {
-			// TODO(stage 3): a redelivered ChargePayment hits the unique
-			// order_id; consumer dedup by message_id will skip it first.
-			return fmt.Errorf("insert payment: %w", err)
+		if p.ID != "" {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO payments (id, order_id, token, amount_cents, currency, status)
+				VALUES ($1, $2, $3, $4, $5, $6)`,
+				p.ID, orderID, token, amountCents, currency, p.Status); err != nil {
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+					return fmt.Errorf("%w: order %s", ErrAlreadyCharged, orderID)
+				}
+				return fmt.Errorf("insert payment: %w", err)
+			}
 		}
-		return outbox.Add(ctx, tx, kafka.TopicPaymentEvents, orderID, &eventsv1.PaymentEvent{
-			MessageId: uuid.NewString(),
-			OrderId:   orderID,
-			CreatedAt: timestamppb.Now(),
-			Event: &eventsv1.PaymentEvent_PaymentSucceeded{
-				PaymentSucceeded: &eventsv1.PaymentSucceeded{PaymentId: p.ID},
-			},
-		})
+
+		ev := &eventsv1.PaymentEvent{MessageId: uuid.NewString(), OrderId: orderID, CreatedAt: timestamppb.Now()}
+		if p.Status == StatusSucceeded {
+			ev.Event = &eventsv1.PaymentEvent_PaymentSucceeded{PaymentSucceeded: &eventsv1.PaymentSucceeded{PaymentId: p.ID}}
+		} else {
+			ev.Event = &eventsv1.PaymentEvent_PaymentFailed{PaymentFailed: &eventsv1.PaymentFailed{Reason: p.FailureReason}}
+		}
+		return outbox.Add(ctx, tx, kafka.TopicPaymentEvents, orderID, ev)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("charge order %s: %w", orderID, err)
 	}
 	return p, nil
+}
+
+// lookupCard reports whether token's card always declines. It returns
+// pgx.ErrNoRows for a token that was never issued.
+func (s *Store) lookupCard(ctx context.Context, tx pgx.Tx, token string) (bool, error) {
+	var alwaysDecline bool
+	err := tx.QueryRow(ctx, `SELECT always_decline FROM cards WHERE token = $1`, token).Scan(&alwaysDecline)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("look up card: %w", err)
+	}
+	return alwaysDecline, err
 }

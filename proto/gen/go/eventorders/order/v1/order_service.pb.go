@@ -31,6 +31,9 @@ const (
 	OrderStatus_ORDER_STATUS_INVENTORY_RESERVED OrderStatus = 2
 	OrderStatus_ORDER_STATUS_CONFIRMED          OrderStatus = 3
 	OrderStatus_ORDER_STATUS_CANCELLED          OrderStatus = 4
+	// Payment failed and the reserved stock is being released. The order moves
+	// to CANCELLED once inventory confirms the release.
+	OrderStatus_ORDER_STATUS_CANCELLING OrderStatus = 5
 )
 
 // Enum value maps for OrderStatus.
@@ -41,6 +44,7 @@ var (
 		2: "ORDER_STATUS_INVENTORY_RESERVED",
 		3: "ORDER_STATUS_CONFIRMED",
 		4: "ORDER_STATUS_CANCELLED",
+		5: "ORDER_STATUS_CANCELLING",
 	}
 	OrderStatus_value = map[string]int32{
 		"ORDER_STATUS_UNSPECIFIED":        0,
@@ -48,6 +52,7 @@ var (
 		"ORDER_STATUS_INVENTORY_RESERVED": 2,
 		"ORDER_STATUS_CONFIRMED":          3,
 		"ORDER_STATUS_CANCELLED":          4,
+		"ORDER_STATUS_CANCELLING":         5,
 	}
 )
 
@@ -194,7 +199,9 @@ type CreateOrderRequest struct {
 	Items      []*v1.LineItem         `protobuf:"bytes,2,rep,name=items,proto3" json:"items,omitempty"`
 	// Opaque token from PaymentService.TokenizeCard. Never a card number.
 	PaymentToken string `protobuf:"bytes,3,opt,name=payment_token,json=paymentToken,proto3" json:"payment_token,omitempty"`
-	// Repeating a request with the same key returns the original order.
+	// Optional, scoped to customer_id. Repeating a request with the same key and
+	// the same items returns the original order; the same key with different
+	// items fails with ALREADY_EXISTS.
 	IdempotencyKey string `protobuf:"bytes,4,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
@@ -259,8 +266,11 @@ func (x *CreateOrderRequest) GetIdempotencyKey() string {
 }
 
 type CreateOrderResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Order         *Order                 `protobuf:"bytes,1,opt,name=order,proto3" json:"order,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Order *Order                 `protobuf:"bytes,1,opt,name=order,proto3" json:"order,omitempty"`
+	// True when the idempotency key matched an earlier request with the same
+	// items, so this is that earlier order and nothing new was created.
+	Replayed      bool `protobuf:"varint,2,opt,name=replayed,proto3" json:"replayed,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -300,6 +310,13 @@ func (x *CreateOrderResponse) GetOrder() *Order {
 		return x.Order
 	}
 	return nil
+}
+
+func (x *CreateOrderResponse) GetReplayed() bool {
+	if x != nil {
+		return x.Replayed
+	}
+	return false
 }
 
 type GetOrderRequest struct {
@@ -414,19 +431,21 @@ const file_eventorders_order_v1_order_service_proto_rawDesc = "" +
 	"customerId\x125\n" +
 	"\x05items\x18\x02 \x03(\v2\x1f.eventorders.common.v1.LineItemR\x05items\x12#\n" +
 	"\rpayment_token\x18\x03 \x01(\tR\fpaymentToken\x12'\n" +
-	"\x0fidempotency_key\x18\x04 \x01(\tR\x0eidempotencyKey\"H\n" +
+	"\x0fidempotency_key\x18\x04 \x01(\tR\x0eidempotencyKey\"d\n" +
 	"\x13CreateOrderResponse\x121\n" +
-	"\x05order\x18\x01 \x01(\v2\x1b.eventorders.order.v1.OrderR\x05order\",\n" +
+	"\x05order\x18\x01 \x01(\v2\x1b.eventorders.order.v1.OrderR\x05order\x12\x1a\n" +
+	"\breplayed\x18\x02 \x01(\bR\breplayed\",\n" +
 	"\x0fGetOrderRequest\x12\x19\n" +
 	"\border_id\x18\x01 \x01(\tR\aorderId\"E\n" +
 	"\x10GetOrderResponse\x121\n" +
-	"\x05order\x18\x01 \x01(\v2\x1b.eventorders.order.v1.OrderR\x05order*\xa2\x01\n" +
+	"\x05order\x18\x01 \x01(\v2\x1b.eventorders.order.v1.OrderR\x05order*\xbf\x01\n" +
 	"\vOrderStatus\x12\x1c\n" +
 	"\x18ORDER_STATUS_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14ORDER_STATUS_PENDING\x10\x01\x12#\n" +
 	"\x1fORDER_STATUS_INVENTORY_RESERVED\x10\x02\x12\x1a\n" +
 	"\x16ORDER_STATUS_CONFIRMED\x10\x03\x12\x1a\n" +
-	"\x16ORDER_STATUS_CANCELLED\x10\x042\xcd\x01\n" +
+	"\x16ORDER_STATUS_CANCELLED\x10\x04\x12\x1b\n" +
+	"\x17ORDER_STATUS_CANCELLING\x10\x052\xcd\x01\n" +
 	"\fOrderService\x12b\n" +
 	"\vCreateOrder\x12(.eventorders.order.v1.CreateOrderRequest\x1a).eventorders.order.v1.CreateOrderResponse\x12Y\n" +
 	"\bGetOrder\x12%.eventorders.order.v1.GetOrderRequest\x1a&.eventorders.order.v1.GetOrderResponseB\xf2\x01\n" +

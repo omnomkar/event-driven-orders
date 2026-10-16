@@ -5,6 +5,7 @@ package orders
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -41,7 +42,7 @@ func TestCreateWritesOrderAndOutboxTogether(t *testing.T) {
 	store := NewStore(pool)
 	ctx := context.Background()
 
-	o, err := store.Create(ctx, validParams())
+	o, _, err := store.Create(ctx, validParams())
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -105,7 +106,7 @@ func TestCreateFailureWritesNeitherOrderNorOutbox(t *testing.T) {
 		t.Fatalf("install failing trigger: %v", err)
 	}
 
-	if _, err := NewStore(pool).Create(ctx, validParams()); err == nil {
+	if _, _, err := NewStore(pool).Create(ctx, validParams()); err == nil {
 		t.Fatal("Create succeeded; want the forced outbox failure")
 	}
 	for _, table := range []string{"orders", "order_items", "order_status_history", "outbox"} {
@@ -120,5 +121,81 @@ func TestGetUnknownOrder(t *testing.T) {
 	_, err := NewStore(pool).Get(context.Background(), "0192f5d1-0000-7000-8000-000000000000")
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("Get(unknown) error = %v, want ErrNotFound", err)
+	}
+}
+
+// The same idempotency key and items return the original order without
+// writing anything new. Different items with that key are refused, and the
+// key is scoped per customer.
+func TestCreateIdempotencyKey(t *testing.T) {
+	pool := testinfra.Postgres(t, migrations.FS)
+	store := NewStore(pool)
+	ctx := context.Background()
+
+	p := validParams()
+	p.IdempotencyKey = "key-1"
+	first, replayed, err := store.Create(ctx, p)
+	if err != nil || replayed {
+		t.Fatalf("first Create: replayed %v, error %v", replayed, err)
+	}
+
+	// Same items listed in another order, with a fresh token: same request.
+	again := p
+	again.PaymentToken = "tok_other"
+	again.Items = []Item{p.Items[1], p.Items[0]}
+	second, replayed, err := store.Create(ctx, again)
+	if err != nil || !replayed || second.ID != first.ID {
+		t.Fatalf("repeat Create = %v, replayed %v, error %v; want order %s replayed", second, replayed, err, first.ID)
+	}
+	if n := count(t, pool, `SELECT count(*) FROM orders`); n != 1 {
+		t.Errorf("orders rows = %d, want 1", n)
+	}
+	if n := count(t, pool, `SELECT count(*) FROM outbox WHERE topic = $1`, kafka.TopicInventoryCommands); n != 1 {
+		t.Errorf("ReserveStock outbox rows = %d, want 1", n)
+	}
+
+	changed := p
+	changed.Items = []Item{{ProductID: "sku-keyboard", Quantity: 5}}
+	if _, _, err := store.Create(ctx, changed); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Errorf("same key, different items: error %v, want ErrIdempotencyConflict", err)
+	}
+
+	other := p
+	other.CustomerID = "cust-2"
+	o, replayed, err := store.Create(ctx, other)
+	if err != nil || replayed || o.ID == first.ID {
+		t.Errorf("same key, other customer: replayed %v, error %v; want a new order", replayed, err)
+	}
+}
+
+// Concurrent requests with one key: the unique constraint lets one insert
+// win, and every other request returns the winner's order.
+func TestCreateIdempotencyKeyConcurrent(t *testing.T) {
+	pool := testinfra.Postgres(t, migrations.FS)
+	store := NewStore(pool)
+	p := validParams()
+	p.IdempotencyKey = "key-race"
+
+	const requests = 10
+	ids := make([]string, requests)
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Go(func() {
+			o, _, err := store.Create(context.Background(), p)
+			if err != nil {
+				t.Errorf("request %d: %v", i, err)
+				return
+			}
+			ids[i] = o.ID
+		})
+	}
+	wg.Wait()
+	for i, id := range ids {
+		if id != ids[0] {
+			t.Fatalf("request %d got order %s, request 0 got %s; want one order", i, id, ids[0])
+		}
+	}
+	if n := count(t, pool, `SELECT count(*) FROM orders`); n != 1 {
+		t.Errorf("orders rows = %d, want 1", n)
 	}
 }

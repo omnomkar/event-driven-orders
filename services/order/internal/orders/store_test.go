@@ -46,3 +46,20 @@ func TestCreateParamsValidate(t *testing.T) {
 		})
 	}
 }
+
+func TestRequestHash(t *testing.T) {
+	a := []Item{{ProductID: "sku-keyboard", Quantity: 1}, {ProductID: "sku-mouse", Quantity: 2}}
+	reordered := []Item{a[1], a[0]}
+	if requestHash(a) != requestHash(reordered) {
+		t.Error("item order changed the hash")
+	}
+	for name, items := range map[string][]Item{
+		"quantity": {{ProductID: "sku-keyboard", Quantity: 2}, {ProductID: "sku-mouse", Quantity: 2}},
+		"product":  {{ProductID: "sku-keyboard", Quantity: 1}, {ProductID: "sku-monitor", Quantity: 2}},
+		"fewer":    {{ProductID: "sku-keyboard", Quantity: 1}},
+	} {
+		if requestHash(items) == requestHash(a) {
+			t.Errorf("%s: different items produced the same hash", name)
+		}
+	}
+}

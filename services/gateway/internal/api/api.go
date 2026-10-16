@@ -87,6 +87,10 @@ type productJSON struct {
 // createOrder tokenizes the card, then creates the order with the token. It
 // answers 202 Accepted with the PENDING order: the saga finishes later, and
 // the client polls GET /orders/{id} for the outcome.
+//
+// With an Idempotency-Key header, repeating the request returns the order
+// the key first created, in its current state, with 200 OK. Reusing the key
+// with different items is 409 Conflict.
 func (a *API) createOrder(w http.ResponseWriter, r *http.Request) {
 	var req createOrderRequest
 	if err := decodeJSON(w, r, &req); err != nil {
@@ -133,8 +137,13 @@ func (a *API) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	o := resp.GetOrder()
-	logging.WithOrder(a.Logger, o.GetOrderId()).Info("order accepted", "card_brand", tok.GetBrand())
 	w.Header().Set("Location", "/orders/"+o.GetOrderId())
+	if resp.GetReplayed() {
+		logging.WithOrder(a.Logger, o.GetOrderId()).Info("idempotent replay", "status", o.GetStatus().String())
+		writeJSON(w, http.StatusOK, toOrderJSON(o))
+		return
+	}
+	logging.WithOrder(a.Logger, o.GetOrderId()).Info("order accepted", "card_brand", tok.GetBrand())
 	writeJSON(w, http.StatusAccepted, toOrderJSON(o))
 }
 
@@ -222,9 +231,9 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
 	return errors.New("request body is not valid JSON")
 }
 
-// writeGRPCError maps a backend error to an HTTP status. InvalidArgument and
-// NotFound messages come from validation code written to be client-safe;
-// anything else is logged and hidden.
+// writeGRPCError maps a backend error to an HTTP status. InvalidArgument,
+// NotFound, and AlreadyExists messages come from code written to be
+// client-safe; anything else is logged and hidden.
 func (a *API) writeGRPCError(w http.ResponseWriter, op string, err error) {
 	st := status.Convert(err)
 	switch st.Code() {
@@ -232,6 +241,8 @@ func (a *API) writeGRPCError(w http.ResponseWriter, op string, err error) {
 		writeError(w, http.StatusBadRequest, st.Message())
 	case codes.NotFound:
 		writeError(w, http.StatusNotFound, st.Message())
+	case codes.AlreadyExists:
+		writeError(w, http.StatusConflict, st.Message())
 	case codes.Unavailable, codes.DeadlineExceeded:
 		a.Logger.Warn("backend unavailable", "op", op, "code", st.Code().String())
 		writeError(w, http.StatusServiceUnavailable, "service temporarily unavailable")
