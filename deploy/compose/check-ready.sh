@@ -5,7 +5,7 @@
 # Exits non-zero if any check fails.
 set -euo pipefail
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 compose=(docker compose -f docker-compose.yml)
 
 if [[ ! -f .env ]]; then
@@ -36,6 +36,8 @@ done
 # output, or nothing on success.
 try_connect() {
   local role="$1" password="$2" db="$3"
+  # Order matters: stderr goes to the capture, then stdout is discarded.
+  # shellcheck disable=SC2069
   "${compose[@]}" exec -T -e PGPASSWORD="$password" postgres \
     psql -h 127.0.0.1 -U "$role" -d "$db" -tAc 'SELECT 1' 2>&1 >/dev/null
 }
@@ -54,8 +56,11 @@ for i in "${!roles[@]}"; do
     fi
 
     if [[ "$i" == "$j" ]]; then
-      [[ "$connected" == yes ]] && pass "$role can connect to $db" \
-        || fail "$role cannot connect to its own database $db: $err"
+      if [[ "$connected" == yes ]]; then
+        pass "$role can connect to $db"
+      else
+        fail "$role cannot connect to its own database $db: $err"
+      fi
     elif [[ "$connected" == no && "$err" == *"permission denied for database"* ]]; then
       pass "$role is denied on $db"
     else

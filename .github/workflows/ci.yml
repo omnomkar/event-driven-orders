@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request cancels the older run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proto:
+    name: proto
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: proto/gen/go/go.mod
+          cache-dependency-path: proto/gen/go/go.sum
+
+      - uses: bufbuild/buf-action@85aebf73123b5c15fd5528aaecbf9129cddf7fa7 # v1.6.0
+        with:
+          version: 1.73.0
+          setup_only: true
+
+      - name: Install protoc plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+
+      - name: buf lint
+        working-directory: proto
+        run: buf lint
+
+      - name: buf format check
+        working-directory: proto
+        run: buf format --diff --exit-code
+
+      - name: Regenerate and fail on any diff
+        run: |
+          make proto
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Generated code is out of date. Run 'make proto' and commit the result."
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+
+  go:
+    name: go (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - pkg
+          - proto/gen/go
+          - services/gateway
+          - services/inventory
+          - services/order
+          - services/payment
+    env:
+      # go.work is for editors only; each module builds from its own go.mod.
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.14.0
+          working-directory: ${{ matrix.module }}
+
+      - name: go test
+        working-directory: ${{ matrix.module }}
+        # -count=1 disables the test cache; no -short, so no test is skipped.
+        run: go test -race -count=1 ./...
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: shellcheck deploy/compose scripts
+        run: |
+          shellcheck --version
+          shellcheck deploy/compose/*.sh
+
+  compose-smoke:
+    name: compose smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start the stack and wait for every container to be healthy
+        run: make up
+
+      - name: Check readiness and database role isolation
+        run: make ready
+
+      - name: Show container status and logs on failure
+        if: failure()
+        run: |
+          docker compose -f deploy/compose/docker-compose.yml ps -a
+          docker compose -f deploy/compose/docker-compose.yml logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: make down
