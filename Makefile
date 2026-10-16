@@ -10,7 +10,7 @@ COMPOSE_ENV := deploy/compose/.env
 # Every directory containing a go.mod, excluding vendored or hidden paths.
 MODULES := $(shell find . -name go.mod -not -path './.*' -exec dirname {} \; | sort)
 
-.PHONY: up down proto lint test ready
+.PHONY: up down proto lint test test-integration ready
 
 ## up: build images and start the local stack, waiting until every container is healthy
 up: $(COMPOSE_ENV)
@@ -36,6 +36,10 @@ lint:
 ## test: run go test with the race detector in every Go module
 test:
 	@for m in $(MODULES); do echo "==> test $$m"; (cd $$m && go test -race ./...); done
+
+## test-integration: run the integration tests (needs Docker; starts real Postgres and Kafka containers)
+test-integration:
+	@for m in $(MODULES); do echo "==> integration $$m"; (cd $$m && go test -tags integration -race -count=1 ./...); done
 
 ## ready: check /readyz on every service and verify database role isolation
 ready:

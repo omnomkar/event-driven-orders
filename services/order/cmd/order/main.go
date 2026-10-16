@@ -1,5 +1,5 @@
-// Command order runs the order service: a gRPC API plus an admin HTTP server
-// for health checks and metrics.
+// Command order runs the order service: a gRPC API, the outbox relay, and an
+// admin HTTP server for health checks and metrics.
 package main
 
 import (
@@ -21,8 +21,12 @@ import (
 	"github.com/omnomkar/event-driven-orders/pkg/health"
 	"github.com/omnomkar/event-driven-orders/pkg/kafka"
 	"github.com/omnomkar/event-driven-orders/pkg/logging"
+	"github.com/omnomkar/event-driven-orders/pkg/outbox"
+	"github.com/omnomkar/event-driven-orders/pkg/postgres"
 	"github.com/omnomkar/event-driven-orders/pkg/server"
 	orderv1 "github.com/omnomkar/event-driven-orders/proto/gen/go/eventorders/order/v1"
+	"github.com/omnomkar/event-driven-orders/services/order/internal/orders"
+	"github.com/omnomkar/event-driven-orders/services/order/migrations"
 )
 
 const (
@@ -52,6 +56,8 @@ func run(logger *slog.Logger) error {
 	databaseURL := cfg.Required("DATABASE_URL")
 	brokers := cfg.RequiredList("KAFKA_BROKERS")
 	shutdownTimeout := cfg.Duration("SHUTDOWN_TIMEOUT", 10*time.Second)
+	migrateTimeout := cfg.Duration("MIGRATE_TIMEOUT", 60*time.Second)
+	outboxInterval := cfg.Duration("OUTBOX_POLL_INTERVAL", 200*time.Millisecond)
 	if err := cfg.Err(); err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -68,6 +74,14 @@ func run(logger *slog.Logger) error {
 	}
 	defer pool.Close()
 
+	// The schema must be current before the service serves anything.
+	migrateCtx, cancelMigrate := context.WithTimeout(ctx, migrateTimeout)
+	err = postgres.Migrate(migrateCtx, pool, migrations.FS, logger)
+	cancelMigrate()
+	if err != nil {
+		return err
+	}
+
 	kc, err := kafka.NewClient(kafka.Config{Brokers: brokers, ClientID: serviceName})
 	if err != nil {
 		return err
@@ -81,7 +95,9 @@ func run(logger *slog.Logger) error {
 	grpcServer := grpc.NewServer()
 	healthServer := grpchealth.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
-	orderv1.RegisterOrderServiceServer(grpcServer, &orderServer{})
+	store := orders.NewStore(pool)
+	orderv1.RegisterOrderServiceServer(grpcServer, orders.NewServer(store, logger))
+	relay := outbox.NewRelay(pool, kc, outbox.RelayConfig{PollInterval: outboxInterval}, logger)
 
 	// errgroup runs each server in its own goroutine. If one fails, gctx is
 	// cancelled so the others shut down too; Wait returns the first error.
@@ -93,6 +109,9 @@ func run(logger *slog.Logger) error {
 		return server.RunHTTP(gctx, server.NewHTTP(adminAddr, health.AdminMux(checks)), shutdownTimeout)
 	})
 	g.Go(func() error {
+		return relay.Run(gctx)
+	})
+	g.Go(func() error {
 		health.SyncGRPCHealth(gctx, checks, healthServer, healthSyncPeriod)
 		return nil
 	})
@@ -101,10 +120,4 @@ func run(logger *slog.Logger) error {
 	err = g.Wait()
 	logger.Info("stopped")
 	return err
-}
-
-// orderServer implements orderv1.OrderServiceServer. The embedded
-// Unimplemented type answers every RPC not yet written with codes.Unimplemented.
-type orderServer struct {
-	orderv1.UnimplementedOrderServiceServer
 }

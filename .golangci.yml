@@ -1,5 +1,10 @@
 version: "2"
 
+run:
+  # Lint integration tests too; they are excluded from plain builds by this tag.
+  build-tags:
+    - integration
+
 linters:
   default: none
   enable:

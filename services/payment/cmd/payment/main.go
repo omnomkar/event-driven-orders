@@ -1,5 +1,6 @@
-// Command payment runs the payment service: a gRPC API plus an admin HTTP server
-// for health checks and metrics.
+// Command payment runs the payment service: a gRPC API for card tokenization,
+// a consumer that charges payments, the outbox relay, and an admin HTTP
+// server for health checks and metrics.
 package main
 
 import (
@@ -21,8 +22,12 @@ import (
 	"github.com/omnomkar/event-driven-orders/pkg/health"
 	"github.com/omnomkar/event-driven-orders/pkg/kafka"
 	"github.com/omnomkar/event-driven-orders/pkg/logging"
+	"github.com/omnomkar/event-driven-orders/pkg/outbox"
+	"github.com/omnomkar/event-driven-orders/pkg/postgres"
 	"github.com/omnomkar/event-driven-orders/pkg/server"
 	paymentv1 "github.com/omnomkar/event-driven-orders/proto/gen/go/eventorders/payment/v1"
+	"github.com/omnomkar/event-driven-orders/services/payment/internal/payments"
+	"github.com/omnomkar/event-driven-orders/services/payment/migrations"
 )
 
 const (
@@ -52,6 +57,8 @@ func run(logger *slog.Logger) error {
 	databaseURL := cfg.Required("DATABASE_URL")
 	brokers := cfg.RequiredList("KAFKA_BROKERS")
 	shutdownTimeout := cfg.Duration("SHUTDOWN_TIMEOUT", 10*time.Second)
+	migrateTimeout := cfg.Duration("MIGRATE_TIMEOUT", 60*time.Second)
+	outboxInterval := cfg.Duration("OUTBOX_POLL_INTERVAL", 200*time.Millisecond)
 	if err := cfg.Err(); err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -68,11 +75,30 @@ func run(logger *slog.Logger) error {
 	}
 	defer pool.Close()
 
-	kc, err := kafka.NewClient(kafka.Config{Brokers: brokers, ClientID: serviceName})
+	// The schema must be current before the service serves anything.
+	migrateCtx, cancelMigrate := context.WithTimeout(ctx, migrateTimeout)
+	err = postgres.Migrate(migrateCtx, pool, migrations.FS, logger)
+	cancelMigrate()
+	if err != nil {
+		return err
+	}
+
+	kafkaCfg := kafka.Config{Brokers: brokers, ClientID: serviceName}
+	kc, err := kafka.NewClient(kafkaCfg)
 	if err != nil {
 		return err
 	}
 	defer kc.Close()
+
+	store := payments.NewStore(pool)
+	consumer, err := kafka.NewConsumer(kafkaCfg,
+		kafka.ConsumerConfig{Group: serviceName, Topics: []string{kafka.TopicPaymentCommands}},
+		store.CommandHandler(logger), logger)
+	if err != nil {
+		return err
+	}
+	defer consumer.Close()
+	relay := outbox.NewRelay(pool, kc, outbox.RelayConfig{PollInterval: outboxInterval}, logger)
 
 	checks := health.NewRegistry()
 	checks.Add("postgres", checkTimeout, pool.Ping)
@@ -81,7 +107,7 @@ func run(logger *slog.Logger) error {
 	grpcServer := grpc.NewServer()
 	healthServer := grpchealth.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
-	paymentv1.RegisterPaymentServiceServer(grpcServer, &paymentServer{})
+	paymentv1.RegisterPaymentServiceServer(grpcServer, payments.NewServer(store, logger))
 
 	// errgroup runs each server in its own goroutine. If one fails, gctx is
 	// cancelled so the others shut down too; Wait returns the first error.
@@ -93,6 +119,12 @@ func run(logger *slog.Logger) error {
 		return server.RunHTTP(gctx, server.NewHTTP(adminAddr, health.AdminMux(checks)), shutdownTimeout)
 	})
 	g.Go(func() error {
+		return consumer.Run(gctx)
+	})
+	g.Go(func() error {
+		return relay.Run(gctx)
+	})
+	g.Go(func() error {
 		health.SyncGRPCHealth(gctx, checks, healthServer, healthSyncPeriod)
 		return nil
 	})
@@ -101,10 +133,4 @@ func run(logger *slog.Logger) error {
 	err = g.Wait()
 	logger.Info("stopped")
 	return err
-}
-
-// paymentServer implements paymentv1.PaymentServiceServer. The embedded
-// Unimplemented type answers every RPC not yet written with codes.Unimplemented.
-type paymentServer struct {
-	paymentv1.UnimplementedPaymentServiceServer
 }
