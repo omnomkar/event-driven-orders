@@ -18,6 +18,14 @@ x-service-env: &service-env
   MIGRATE_TIMEOUT: 60s
   # How often the outbox relay looks for unsent messages.
   OUTBOX_POLL_INTERVAL: 200ms
+  # A crashed consumer's partitions move to another member (or to its own
+  # restart) after this long without heartbeats. Kafka's default is 45s.
+  KAFKA_SESSION_TIMEOUT: 10s
+  # Retries in place with exponential backoff and full jitter, then the
+  # record goes to <topic>.dlq.
+  CONSUMER_MAX_ATTEMPTS: "5"
+  CONSUMER_RETRY_BASE: 100ms
+  CONSUMER_RETRY_CAP: 5s
 
 x-service-healthcheck: &service-healthcheck
   interval: 5s

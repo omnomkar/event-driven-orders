@@ -8,3 +8,17 @@ const (
 	TopicPaymentEvents     = "payment.events"
 	TopicOrderEvents       = "order.events"
 )
+
+// Topics lists every topic. Each one's dead-letter topic is DLQTopic(t).
+var Topics = []string{
+	TopicInventoryCommands,
+	TopicInventoryEvents,
+	TopicPaymentCommands,
+	TopicPaymentEvents,
+	TopicOrderEvents,
+}
+
+// DLQTopic returns the dead-letter topic for topic.
+func DLQTopic(topic string) string { return topic + dlqSuffix }
+
+const dlqSuffix = ".dlq"

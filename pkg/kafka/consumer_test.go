@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"testing"
 	"time"
 
@@ -36,11 +37,17 @@ func TestHandleWithRetry(t *testing.T) {
 				calls++
 				return err
 			}
-			var failed error
+			var (
+				failed   error
+				attempts int
+			)
 			cfg := ConsumerConfig{
 				MaxAttempts: 3,
 				Backoff:     func(int) time.Duration { return time.Millisecond },
-				OnFailure:   func(_ context.Context, _ *kgo.Record, err error) { failed = err },
+				OnFailure: func(_ context.Context, _ *kgo.Record, n int, err error) error {
+					failed, attempts = err, n
+					return nil
+				},
 			}
 
 			complete := handleWithRetry(context.Background(), &kgo.Record{Key: []byte("order-1")}, h, cfg, discardLogger())
@@ -51,10 +58,67 @@ func TestHandleWithRetry(t *testing.T) {
 			if (failed != nil) != tt.wantFailure {
 				t.Errorf("OnFailure called = %v, want %v (err %v)", failed != nil, tt.wantFailure, failed)
 			}
+			if failed != nil && attempts != tt.wantCalls {
+				t.Errorf("OnFailure got attempts = %d, want %d", attempts, tt.wantCalls)
+			}
 			if complete != tt.wantComplete {
 				t.Errorf("complete = %v, want %v", complete, tt.wantComplete)
 			}
 		})
+	}
+}
+
+// Each retry waits Backoff(n) for the nth retry: the schedule is driven by
+// the attempt number, and the last attempt is not followed by a wait.
+func TestHandleWithRetryUsesBackoffSchedule(t *testing.T) {
+	var waits []int
+	cfg := ConsumerConfig{
+		MaxAttempts: 4,
+		Backoff: func(n int) time.Duration {
+			waits = append(waits, n)
+			return time.Millisecond
+		},
+		OnFailure: func(context.Context, *kgo.Record, int, error) error { return nil },
+	}
+	h := func(context.Context, *kgo.Record) error { return errors.New("still down") }
+	handleWithRetry(context.Background(), &kgo.Record{}, h, cfg, discardLogger())
+	if want := []int{1, 2, 3}; !slices.Equal(waits, want) {
+		t.Errorf("backoff called for retries %v, want %v", waits, want)
+	}
+}
+
+// If the failure handler cannot take the record (the dead-letter publish
+// fails), it is called again until it succeeds; the record is complete only
+// then, so it is never committed without being kept.
+func TestHandleWithRetryRetriesFailureHandler(t *testing.T) {
+	calls := 0
+	cfg := ConsumerConfig{
+		MaxAttempts: 1,
+		Backoff:     func(int) time.Duration { return time.Millisecond },
+		OnFailure: func(context.Context, *kgo.Record, int, error) error {
+			calls++
+			if calls < 3 {
+				return errors.New("dlq unavailable")
+			}
+			return nil
+		},
+	}
+	h := func(context.Context, *kgo.Record) error { return Permanent(errors.New("bad payload")) }
+	if !handleWithRetry(context.Background(), &kgo.Record{}, h, cfg, discardLogger()) {
+		t.Error("record not complete after the failure handler succeeded")
+	}
+	if calls != 3 {
+		t.Errorf("failure handler called %d times, want 3", calls)
+	}
+
+	// During shutdown a failing handler leaves the record uncommitted.
+	ctx, cancel := context.WithCancel(context.Background())
+	cfg.OnFailure = func(context.Context, *kgo.Record, int, error) error {
+		cancel()
+		return errors.New("dlq unavailable")
+	}
+	if handleWithRetry(ctx, &kgo.Record{}, h, cfg, discardLogger()) {
+		t.Error("record reported complete although the failure handler never succeeded")
 	}
 }
 
@@ -69,7 +133,10 @@ func TestHandleWithRetryStopsOnCancel(t *testing.T) {
 	cfg := ConsumerConfig{
 		MaxAttempts: 3,
 		Backoff:     func(int) time.Duration { return time.Hour },
-		OnFailure:   func(context.Context, *kgo.Record, error) { t.Error("OnFailure must not run during shutdown") },
+		OnFailure: func(context.Context, *kgo.Record, int, error) error {
+			t.Error("OnFailure must not run during shutdown")
+			return nil
+		},
 	}
 
 	if handleWithRetry(ctx, &kgo.Record{}, h, cfg, discardLogger()) {

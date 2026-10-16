@@ -35,10 +35,11 @@ func (r *recorder) handle(_ context.Context, rec *kgo.Record) error {
 	return nil
 }
 
-func (r *recorder) onFailure(_ context.Context, rec *kgo.Record, _ error) {
+func (r *recorder) onFailure(_ context.Context, rec *kgo.Record, _ int, _ error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.failed = append(r.failed, string(rec.Key))
+	return nil
 }
 
 func (r *recorder) count() int {

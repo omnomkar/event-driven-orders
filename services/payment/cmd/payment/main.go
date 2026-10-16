@@ -59,6 +59,10 @@ func run(logger *slog.Logger) error {
 	shutdownTimeout := cfg.Duration("SHUTDOWN_TIMEOUT", 10*time.Second)
 	migrateTimeout := cfg.Duration("MIGRATE_TIMEOUT", 60*time.Second)
 	outboxInterval := cfg.Duration("OUTBOX_POLL_INTERVAL", 200*time.Millisecond)
+	// Retry and group settings (CONSUMER_MAX_ATTEMPTS, CONSUMER_RETRY_BASE,
+	// CONSUMER_RETRY_CAP, KAFKA_SESSION_TIMEOUT) are shared by every service.
+	consumerCfg := kafka.ConsumerSettings(cfg)
+	consumerCfg.Group, consumerCfg.Topics = serviceName, []string{kafka.TopicPaymentCommands}
 	if err := cfg.Err(); err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -91,8 +95,7 @@ func run(logger *slog.Logger) error {
 	defer kc.Close()
 
 	store := payments.NewStore(pool)
-	consumer, err := kafka.NewConsumer(kafkaCfg,
-		kafka.ConsumerConfig{Group: serviceName, Topics: []string{kafka.TopicPaymentCommands}},
+	consumer, err := kafka.NewConsumer(kafkaCfg, consumerCfg,
 		store.CommandHandler(logger), logger)
 	if err != nil {
 		return err

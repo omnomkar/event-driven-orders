@@ -126,10 +126,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: shellcheck deploy/compose scripts
+      - name: shellcheck scripts
         run: |
           shellcheck --version
-          shellcheck deploy/compose/*.sh
+          shellcheck deploy/compose/*.sh scripts/*.sh
 
   compose-smoke:
     name: compose smoke test
@@ -143,6 +143,13 @@ jobs:
 
       - name: Check readiness and database role isolation
         run: make ready
+
+      # Reuses the stack started above, so it adds about a minute instead of
+      # a second image build.
+      - name: Chaos test (kill payment mid-run, expect exactly one charge per order)
+        env:
+          CHAOS_ORDERS: "30"
+        run: make chaos
 
       - name: Show container status and logs on failure
         if: failure()

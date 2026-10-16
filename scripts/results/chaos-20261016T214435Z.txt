@@ -1,0 +1,22 @@
+Chaos run chaos-20261016T214435Z
+
+Setup
+  orders placed:                 200 (concurrency 20)
+  accepted by the gateway (202): 200
+  payment killed at:             2026-10-16T21:44:59Z (SIGKILL)
+  payment down for:              25s (kill until restart)
+  orders at kill:                CONFIRMED=1 INVENTORY_RESERVED=199
+  payments recorded at kill:     26
+  not final at kill:             199
+
+Outcome
+  all final within:              1s of restart
+  confirmed:                     200
+  cancelled:                     0
+  not final:                     0
+  payment rows:                  200 (200 succeeded)
+  orders with >1 payment:        0
+  redeliveries skipped by dedup: 25 (payment service, after restart)
+  dead-letter records added:     0
+
+Result: PASS

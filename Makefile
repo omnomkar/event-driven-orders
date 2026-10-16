@@ -10,7 +10,7 @@ COMPOSE_ENV := deploy/compose/.env
 # Every directory containing a go.mod, excluding vendored or hidden paths.
 MODULES := $(shell find . -name go.mod -not -path './.*' -exec dirname {} \; | sort)
 
-.PHONY: up down proto lint test test-integration ready
+.PHONY: up down proto lint test test-integration ready dlq dlq-replay chaos
 
 ## up: build images and start the local stack, waiting until every container is healthy
 up: $(COMPOSE_ENV)
@@ -44,3 +44,16 @@ test-integration:
 ## ready: check /readyz on every service and verify database role isolation
 ready:
 	bash deploy/compose/check-ready.sh
+
+## dlq: print every record in every dead-letter topic (stack must be up)
+dlq:
+	bash scripts/dlq.sh list
+
+## dlq-replay: publish a dead-letter topic's records back to its source, e.g. make dlq-replay TOPIC=inventory.commands.dlq
+dlq-replay:
+	@if [ -z "$(TOPIC)" ]; then echo "usage: make dlq-replay TOPIC=<topic>.dlq"; exit 2; fi
+	bash scripts/dlq.sh replay "$(TOPIC)"
+
+## chaos: kill the payment service mid-run and check every order finishes with exactly one charge
+chaos: $(COMPOSE_ENV)
+	bash scripts/chaos.sh

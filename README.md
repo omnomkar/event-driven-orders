@@ -9,8 +9,9 @@ Status: early development. Setup instructions, the architecture diagram, and loa
 ```
 proto/       Protobuf definitions and generated Go code
 services/    gateway, order, payment, inventory
-pkg/         shared Go packages (config, logging, health, kafka)
+pkg/         shared Go packages (config, logging, health, kafka, outbox, dedup)
 deploy/      Docker Compose for local development, Helm charts
+scripts/     chaos test and dead-letter tools, with saved chaos reports
 loadtest/    k6 scripts and saved results
 docs/        design decisions
 ```

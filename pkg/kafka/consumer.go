@@ -3,11 +3,12 @@ package kafka
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	"github.com/omnomkar/event-driven-orders/pkg/config"
 )
 
 // Handler processes one record. It should do all of its work inside one
@@ -18,9 +19,10 @@ import (
 type Handler func(ctx context.Context, rec *kgo.Record) error
 
 // FailureHandler is called for a record that failed permanently or ran out of
-// retries. After it returns, the record's offset is committed and the
-// consumer moves on, so it must not drop the record silently.
-type FailureHandler func(ctx context.Context, rec *kgo.Record, err error)
+// attempts. The record's offset is committed only after it returns nil, so it
+// must not drop the record silently: if it returns an error, the consumer
+// calls it again (with backoff) until it succeeds or the consumer shuts down.
+type FailureHandler func(ctx context.Context, rec *kgo.Record, attempts int, err error) error
 
 // permanentError marks an error that retrying cannot fix, such as a payload
 // that does not decode or an event that is not valid in the order's state.
@@ -50,14 +52,41 @@ type ConsumerConfig struct {
 	Group  string
 	Topics []string
 	// MaxAttempts is how many times a record is handled before it is passed
-	// to OnFailure. Default 3.
+	// to OnFailure. Default 5.
 	MaxAttempts int
 	// Backoff returns the wait before retry number attempt (1 for the first
-	// retry). Default: a constant 100ms.
+	// retry). Default: exponential with full jitter, base 100ms, cap 5s.
 	Backoff func(attempt int) time.Duration
 	// OnFailure receives records that failed permanently or ran out of
-	// attempts. Default: LogFailure.
+	// attempts. Default: DeadLetter, which publishes them to Topic + ".dlq".
 	OnFailure FailureHandler
+	// SessionTimeout is how long the group waits for a silent member before
+	// giving its partitions to others. A shorter timeout means a crashed
+	// instance's partitions move sooner. Default: franz-go's 45s.
+	SessionTimeout time.Duration
+}
+
+// Default retry settings, used when ConsumerConfig leaves them unset.
+const (
+	DefaultMaxAttempts = 5
+	DefaultRetryBase   = 100 * time.Millisecond
+	DefaultRetryCap    = 5 * time.Second
+)
+
+// ConsumerSettings reads the retry and group settings every consumer shares
+// from the environment: CONSUMER_MAX_ATTEMPTS, CONSUMER_RETRY_BASE,
+// CONSUMER_RETRY_CAP, and KAFKA_SESSION_TIMEOUT. The caller sets Group and
+// Topics.
+func ConsumerSettings(l *config.Loader) ConsumerConfig {
+	b := Backoff{
+		Base: l.Duration("CONSUMER_RETRY_BASE", DefaultRetryBase),
+		Cap:  l.Duration("CONSUMER_RETRY_CAP", DefaultRetryCap),
+	}
+	return ConsumerConfig{
+		MaxAttempts:    l.Int("CONSUMER_MAX_ATTEMPTS", DefaultMaxAttempts),
+		Backoff:        b.Delay,
+		SessionTimeout: l.Duration("KAFKA_SESSION_TIMEOUT", 0),
+	}
 }
 
 // Consumer reads records from a consumer group and hands each one to a
@@ -77,9 +106,8 @@ func NewConsumer(cfg Config, cc ConsumerConfig, h Handler, logger *slog.Logger) 
 		return nil, errors.New("consumer needs a group and at least one topic")
 	}
 	logger = logger.With("component", "consumer", "group", cc.Group)
-	cc = withDefaults(cc, logger)
 
-	client, err := NewClient(cfg,
+	opts := []kgo.Opt{
 		kgo.ConsumerGroup(cc.Group),
 		kgo.ConsumeTopics(cc.Topics...),
 		kgo.DisableAutoCommit(),
@@ -87,43 +115,31 @@ func NewConsumer(cfg Config, cc ConsumerConfig, h Handler, logger *slog.Logger) 
 		// Hold off rebalances between a poll and its commit, so a partition
 		// cannot move to another member while its records are being handled.
 		kgo.BlockRebalanceOnPoll(),
-	)
+	}
+	if cc.SessionTimeout > 0 {
+		opts = append(opts, kgo.SessionTimeout(cc.SessionTimeout))
+	}
+	client, err := NewClient(cfg, opts...)
 	if err != nil {
 		return nil, err
+	}
+	cc = withDefaults(cc)
+	if cc.OnFailure == nil {
+		// The same client consumes the source topic and produces to its
+		// dead-letter topic.
+		cc.OnFailure = DeadLetter(client, logger)
 	}
 	return &Consumer{client: client, cfg: cc, handler: h, logger: logger}, nil
 }
 
-func withDefaults(cc ConsumerConfig, logger *slog.Logger) ConsumerConfig {
+func withDefaults(cc ConsumerConfig) ConsumerConfig {
 	if cc.MaxAttempts <= 0 {
-		cc.MaxAttempts = 3
+		cc.MaxAttempts = DefaultMaxAttempts
 	}
 	if cc.Backoff == nil {
-		// TODO(stage 3): exponential backoff with jitter.
-		cc.Backoff = func(int) time.Duration { return 100 * time.Millisecond }
-	}
-	if cc.OnFailure == nil {
-		// TODO(stage 3): replace LogFailure with a handler that publishes the
-		// record to rec.Topic + ".dlq", so nothing is dropped. This is the
-		// single place every service's failed records go through.
-		cc.OnFailure = LogFailure(logger)
+		cc.Backoff = Backoff{Base: DefaultRetryBase, Cap: DefaultRetryCap}.Delay
 	}
 	return cc
-}
-
-// LogFailure returns a FailureHandler that logs the failed record. It is a
-// placeholder until the dead-letter topic exists: the record is logged with
-// its position so it can be found and replayed by hand.
-func LogFailure(logger *slog.Logger) FailureHandler {
-	return func(_ context.Context, rec *kgo.Record, err error) {
-		logger.Error("record failed, skipping",
-			"order_id", string(rec.Key),
-			"topic", rec.Topic,
-			"partition", rec.Partition,
-			"offset", rec.Offset,
-			"permanent", IsPermanent(err),
-			"error", err)
-	}
 }
 
 // Client returns the underlying franz-go client, for readiness checks.
@@ -176,11 +192,16 @@ func (c *Consumer) process(ctx context.Context, rec *kgo.Record) bool {
 
 // handleWithRetry is the retry policy, separate from Kafka so it can be unit
 // tested with plain records.
+//
+// Retries happen in place: while a record waits for its next attempt, the
+// records behind it on the same partition wait too. That keeps one order's
+// messages in order, at the cost of blocking the partition during backoff.
 func handleWithRetry(ctx context.Context, rec *kgo.Record, h Handler, cfg ConsumerConfig, logger *slog.Logger) bool {
 	attempt := 0
+	var err error
 	for {
 		attempt++
-		err := h(ctx, rec)
+		err = h(ctx, rec)
 		if err == nil {
 			return true
 		}
@@ -188,15 +209,42 @@ func handleWithRetry(ctx context.Context, rec *kgo.Record, h Handler, cfg Consum
 			return false
 		}
 		if IsPermanent(err) || attempt >= cfg.MaxAttempts {
-			cfg.OnFailure(ctx, rec, fmt.Errorf("after %d attempt(s): %w", attempt, err))
-			return true
+			break
 		}
 		logger.Warn("record failed, retrying",
 			"order_id", string(rec.Key), "topic", rec.Topic, "attempt", attempt, "error", err)
-		select {
-		case <-ctx.Done():
+		if !sleep(ctx, cfg.Backoff(attempt)) {
 			return false
-		case <-time.After(cfg.Backoff(attempt)):
 		}
+	}
+
+	// The record is done with retries. It may be committed only once the
+	// failure handler has taken it, so a failing dead-letter publish is
+	// retried rather than skipped.
+	for try := 1; ; try++ {
+		ferr := cfg.OnFailure(ctx, rec, attempt, err)
+		if ferr == nil {
+			return true
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		logger.Error("failure handler failed, retrying",
+			"order_id", string(rec.Key), "topic", rec.Topic, "offset", rec.Offset, "error", ferr)
+		if !sleep(ctx, cfg.Backoff(try)) {
+			return false
+		}
+	}
+}
+
+// sleep waits for d and reports whether it finished before ctx was cancelled.
+func sleep(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
