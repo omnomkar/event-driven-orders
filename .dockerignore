@@ -3,6 +3,7 @@
 .github
 docs
 loadtest
+tests
 deploy
 **/bin
 .env

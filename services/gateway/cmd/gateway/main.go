@@ -18,6 +18,10 @@ import (
 	"github.com/omnomkar/event-driven-orders/pkg/health"
 	"github.com/omnomkar/event-driven-orders/pkg/logging"
 	"github.com/omnomkar/event-driven-orders/pkg/server"
+	inventoryv1 "github.com/omnomkar/event-driven-orders/proto/gen/go/eventorders/inventory/v1"
+	orderv1 "github.com/omnomkar/event-driven-orders/proto/gen/go/eventorders/order/v1"
+	paymentv1 "github.com/omnomkar/event-driven-orders/proto/gen/go/eventorders/payment/v1"
+	"github.com/omnomkar/event-driven-orders/services/gateway/internal/api"
 )
 
 const (
@@ -60,6 +64,7 @@ func run(logger *slog.Logger) error {
 	// start before the backends; /readyz reports which ones are not serving.
 	// Plaintext is a local-only choice; mTLS is planned for a later stage.
 	checks := health.NewRegistry()
+	conns := make(map[string]*grpc.ClientConn, len(backends))
 	for name, addr := range backends {
 		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
@@ -67,9 +72,17 @@ func run(logger *slog.Logger) error {
 		}
 		defer func() { _ = conn.Close() }()
 		checks.Add(name, checkTimeout, health.GRPCCheck(conn))
+		conns[name] = conn
 	}
 
+	// Public REST routes share the server with /healthz, /readyz, and /metrics.
 	mux := health.AdminMux(checks)
+	(&api.API{
+		Orders:    orderv1.NewOrderServiceClient(conns["order"]),
+		Payments:  paymentv1.NewPaymentServiceClient(conns["payment"]),
+		Inventory: inventoryv1.NewInventoryServiceClient(conns["inventory"]),
+		Logger:    logger,
+	}).Register(mux)
 	logger.Info("started", "http_addr", httpAddr)
 	err := server.RunHTTP(ctx, server.NewHTTP(httpAddr, mux), shutdownTimeout)
 	logger.Info("stopped")

@@ -9,6 +9,7 @@ replace (
 
 require (
 	github.com/omnomkar/event-driven-orders/pkg v0.0.0-00010101000000-000000000000
+	github.com/omnomkar/event-driven-orders/proto/gen/go v0.0.0-00010101000000-000000000000
 	google.golang.org/grpc v1.84.0
 )
 

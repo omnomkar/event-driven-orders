@@ -37,9 +37,9 @@ lint:
 test:
 	@for m in $(MODULES); do echo "==> test $$m"; (cd $$m && go test -race ./...); done
 
-## test-integration: run the integration tests (needs Docker; starts real Postgres and Kafka containers)
+## test-integration: run integration and end-to-end tests (needs Docker; stop the local stack first)
 test-integration:
-	@for m in $(MODULES); do echo "==> integration $$m"; (cd $$m && go test -tags integration -race -count=1 ./...); done
+	@for m in $(MODULES); do echo "==> integration $$m"; (cd $$m && go test -tags integration -race -count=1 -timeout 20m ./...); done
 
 ## ready: check /readyz on every service and verify database role isolation
 ready:

@@ -1,5 +1,6 @@
-// Command order runs the order service: a gRPC API, the outbox relay, and an
-// admin HTTP server for health checks and metrics.
+// Command order runs the order service: a gRPC API, the saga consumer that
+// orchestrates each order, the outbox relay, and an admin HTTP server for
+// health checks and metrics.
 package main
 
 import (
@@ -82,7 +83,8 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	kc, err := kafka.NewClient(kafka.Config{Brokers: brokers, ClientID: serviceName})
+	kafkaCfg := kafka.Config{Brokers: brokers, ClientID: serviceName}
+	kc, err := kafka.NewClient(kafkaCfg)
 	if err != nil {
 		return err
 	}
@@ -97,6 +99,13 @@ func run(logger *slog.Logger) error {
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
 	store := orders.NewStore(pool)
 	orderv1.RegisterOrderServiceServer(grpcServer, orders.NewServer(store, logger))
+	saga, err := kafka.NewConsumer(kafkaCfg,
+		kafka.ConsumerConfig{Group: "order-saga", Topics: orders.SagaTopics},
+		store.SagaHandler(logger), logger)
+	if err != nil {
+		return err
+	}
+	defer saga.Close()
 	relay := outbox.NewRelay(pool, kc, outbox.RelayConfig{PollInterval: outboxInterval}, logger)
 
 	// errgroup runs each server in its own goroutine. If one fails, gctx is
@@ -107,6 +116,9 @@ func run(logger *slog.Logger) error {
 	})
 	g.Go(func() error {
 		return server.RunHTTP(gctx, server.NewHTTP(adminAddr, health.AdminMux(checks)), shutdownTimeout)
+	})
+	g.Go(func() error {
+		return saga.Run(gctx)
 	})
 	g.Go(func() error {
 		return relay.Run(gctx)

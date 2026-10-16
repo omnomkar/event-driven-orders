@@ -9,6 +9,11 @@ name: eventorders
 x-service-env: &service-env
   KAFKA_BROKERS: kafka:9092
   SHUTDOWN_TIMEOUT: 10s
+  # Each service applies its embedded migrations at startup, before serving,
+  # and gives up if Postgres is not reachable within this time.
+  MIGRATE_TIMEOUT: 60s
+  # How often the outbox relay looks for unsent messages.
+  OUTBOX_POLL_INTERVAL: 200ms
 
 x-service-healthcheck: &service-healthcheck
   interval: 5s
