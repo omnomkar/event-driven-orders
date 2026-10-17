@@ -1,0 +1,55 @@
+
+
+  █ THRESHOLDS 
+
+    checks
+    ✓ 'rate>0.99' rate=100.00%
+
+    http_req_duration{kind:order}
+    ✓ 'p(95)<500' p(95)=12.82ms
+
+    http_req_duration{kind:read}
+    ✓ 'p(95)<200' p(95)=1.78ms
+
+    http_req_failed
+    ✓ 'rate<0.01' rate=0.00%
+
+    http_reqs{kind:order}
+    ✓ 'count>0' count=15951
+
+    http_reqs{kind:read}
+    ✓ 'count>0' count=64070
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 80021   380.950568/s
+    checks_succeeded...: 100.00% 80021 out of 80021
+    checks_failed......: 0.00%   0 out of 80021
+
+    ✓ create order is 202
+    ✓ list products is 200
+    ✓ get product is 200
+
+    HTTP
+    http_req_duration..............: avg=2.28ms   min=392.99µs med=1.05ms   p(90)=5.78ms   p(95)=7.4ms   p(99)=12.89ms  max=205.43ms
+      { expected_response:true }...: avg=2.28ms   min=392.99µs med=1.05ms   p(90)=5.78ms   p(95)=7.4ms   p(99)=12.89ms  max=205.43ms
+      { kind:order }...............: avg=7.14ms   min=2.83ms   med=5.74ms   p(90)=10.1ms   p(95)=12.82ms p(99)=28.27ms  max=205.43ms
+      { kind:read }................: avg=1.07ms   min=392.99µs med=958.38µs p(90)=1.48ms   p(95)=1.78ms  p(99)=3.08ms   max=19.37ms 
+    http_req_failed................: 0.00% 0 out of 80021
+    http_reqs......................: 80021 380.950568/s
+      { kind:order }...............: 15951 75.936848/s
+      { kind:read }................: 64070 305.01372/s
+
+    EXECUTION
+    iteration_duration.............: avg=102.92ms min=100.6ms  med=101.8ms  p(90)=106.45ms p(95)=108.1ms p(99)=113.59ms max=306.16ms
+    iterations.....................: 80021 380.950568/s
+    vus............................: 1     min=0          max=50
+    vus_max........................: 50    min=50         max=50
+
+    NETWORK
+    data_received..................: 46 MB 221 kB/s
+    data_sent......................: 11 MB 51 kB/s
+
+
+

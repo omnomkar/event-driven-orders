@@ -71,8 +71,18 @@ type CachedCatalog struct {
 	// gRPC handlers and the consumer call the catalog concurrently.
 	bypassUntil atomic.Int64
 
-	hits, misses, errs prometheus.Counter
+	// hits and misses are labelled by key kind ("product" or "list"), so
+	// the list key's churn (every stock change deletes it) can be told
+	// apart from single-product reads.
+	hits, misses *prometheus.CounterVec
+	errs         prometheus.Counter
 }
+
+// Key kind label values for the hit and miss counters.
+const (
+	kindProduct = "product"
+	kindList    = "list"
+)
 
 // DefaultBypass is the default CachedCatalog.BypassFor.
 const DefaultBypass = 5 * time.Second
@@ -90,27 +100,31 @@ func NewCachedCatalog(db Catalog, cache Cache, ttl time.Duration, reg prometheus
 		logger:    logger.With("component", "cache"),
 		BypassFor: DefaultBypass,
 		now:       time.Now,
-		hits: prometheus.NewCounter(prometheus.CounterOpts{
+		hits: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "inventory_cache_hits_total",
-			Help: "Catalog reads answered from the cache.",
-		}),
-		misses: prometheus.NewCounter(prometheus.CounterOpts{
+			Help: "Catalog reads answered from the cache, by key kind (product or list).",
+		}, []string{"key"}),
+		misses: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "inventory_cache_misses_total",
-			Help: "Catalog reads not in the cache, answered from Postgres and then cached.",
-		}),
+			Help: "Catalog reads not in the cache, answered from Postgres and then cached, by key kind.",
+		}, []string{"key"}),
 		errs: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "inventory_cache_errors_total",
 			Help: "Cache operations (get, set, delete) that failed; reads fell back to Postgres.",
 		}),
 	}
 	reg.MustRegister(c.hits, c.misses, c.errs)
+	for _, kind := range []string{kindProduct, kindList} {
+		c.hits.WithLabelValues(kind)
+		c.misses.WithLabelValues(kind)
+	}
 	return c
 }
 
 // GetProduct returns one product, from the cache when it can.
 func (c *CachedCatalog) GetProduct(ctx context.Context, id string) (*Product, error) {
 	var p Product
-	cached, err := c.lookup(ctx, productKey(id), &p)
+	cached, err := c.lookup(ctx, productKey(id), kindProduct, &p)
 	if cached {
 		return &p, nil
 	}
@@ -127,7 +141,7 @@ func (c *CachedCatalog) GetProduct(ctx context.Context, id string) (*Product, er
 // ListProducts returns the whole catalog, from the cache when it can.
 func (c *CachedCatalog) ListProducts(ctx context.Context) ([]Product, error) {
 	var ps []Product
-	cached, err := c.lookup(ctx, keyAllProducts, &ps)
+	cached, err := c.lookup(ctx, keyAllProducts, kindList, &ps)
 	if cached {
 		return ps, nil
 	}
@@ -165,7 +179,7 @@ func (c *CachedCatalog) Invalidate(ctx context.Context, productIDs []string) {
 // lookup reads key into v. It returns true on a hit. A non-nil error means
 // the cache failed (it has been logged and counted) or is being bypassed, so
 // the caller should not try to write to it either.
-func (c *CachedCatalog) lookup(ctx context.Context, key string, v any) (bool, error) {
+func (c *CachedCatalog) lookup(ctx context.Context, key, kind string, v any) (bool, error) {
 	if c.bypassed() {
 		return false, errBypassed
 	}
@@ -173,7 +187,7 @@ func (c *CachedCatalog) lookup(ctx context.Context, key string, v any) (bool, er
 	if err == nil && ok {
 		err = json.Unmarshal(raw, v)
 		if err == nil {
-			c.hits.Inc()
+			c.hits.WithLabelValues(kind).Inc()
 			return true, nil
 		}
 		err = fmt.Errorf("decode cached %s: %w", key, err)
@@ -184,7 +198,7 @@ func (c *CachedCatalog) lookup(ctx context.Context, key string, v any) (bool, er
 			"bypass", c.BypassFor.String(), "error", err)
 		return false, err
 	}
-	c.misses.Inc()
+	c.misses.WithLabelValues(kind).Inc()
 	return false, nil
 }
 

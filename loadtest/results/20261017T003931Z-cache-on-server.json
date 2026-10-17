@@ -1,0 +1,26 @@
+{
+  "run_id": "k6-20261017T003931Z-on",
+  "cache": "on",
+  "window": {"start_unix": 1792197599, "k6_end_unix": 1792197810, "drained_unix": 1792197810, "end_unix": 1792197816, "seconds": 217},
+  "k6_exit_status": 0,
+  "prometheus": {
+    "saga_duration_seconds": {"p50": 0.6661262160139686, "p95": 0.9668745323023197, "p99": 0.9936077159723955, "method": "histogram_quantile over increase(saga_duration_seconds_bucket[window])"},
+    "max_consumer_lag": {"order-saga": 39, "inventory": 22, "payment": 24, "method": "max_over_time of the per-group sum of kafka_consumer_lag, 5s steps; the gauge refreshes every 10s"},
+    "counters_increase": {
+      "hits_product": 24003,
+      "hits_list": 24601,
+      "misses_product": 7850,
+      "misses_list": 7368,
+      "cache_errors": 0,
+      "saga_confirmed": 16076,
+      "saga_cancelled_out_of_stock": 0,
+      "saga_cancelled_payment_failed": 0,
+      "saga_dead_lettered": 0,
+      "dlq_records": 0
+    }
+  },
+  "postgres": {
+    "orders": 16076, "confirmed": 16076, "cancelled": 0, "payments_since_start": 16076,
+    "saga_duration_seconds": {"p50": 0.639279, "p95": 0.852541, "p99": 0.9131355000000001, "max": 1.013238, "method": "exact, updated_at - created_at of the run's orders"}
+  }
+}

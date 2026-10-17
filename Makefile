@@ -10,7 +10,7 @@ COMPOSE_ENV := deploy/compose/.env
 # Every directory containing a go.mod, excluding vendored or hidden paths.
 MODULES := $(shell find . -name go.mod -not -path './.*' -exec dirname {} \; | sort)
 
-.PHONY: up down proto lint test test-integration ready metrics dlq dlq-replay chaos
+.PHONY: up down proto lint test test-integration ready metrics dlq dlq-replay chaos loadtest
 
 ## up: build images and start the local stack, waiting until every container is healthy
 up: $(COMPOSE_ENV)
@@ -57,6 +57,10 @@ dlq:
 dlq-replay:
 	@if [ -z "$(TOPIC)" ]; then echo "usage: make dlq-replay TOPIC=<topic>.dlq"; exit 2; fi
 	bash scripts/dlq.sh replay "$(TOPIC)"
+
+## loadtest: run the k6 load test with the catalog cache on or off, e.g. make loadtest CACHE=off (results in loadtest/results/)
+loadtest: $(COMPOSE_ENV)
+	bash scripts/loadtest.sh $(or $(CACHE),on)
 
 ## chaos: kill the payment service mid-run and check every order finishes with exactly one charge
 chaos: $(COMPOSE_ENV)

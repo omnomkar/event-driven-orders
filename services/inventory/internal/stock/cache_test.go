@@ -107,7 +107,12 @@ func newCacheHarness() *cacheHarness {
 
 // counts returns the hit, miss, and error counters.
 func (h *cacheHarness) counts() [3]float64 {
-	return [3]float64{testutil.ToFloat64(h.cat.hits), testutil.ToFloat64(h.cat.misses), testutil.ToFloat64(h.cat.errs)}
+	return [3]float64{sumKinds(h.cat.hits), sumKinds(h.cat.misses), testutil.ToFloat64(h.cat.errs)}
+}
+
+// sumKinds adds a counter's product and list series.
+func sumKinds(v *prometheus.CounterVec) float64 {
+	return testutil.ToFloat64(v.WithLabelValues(kindProduct)) + testutil.ToFloat64(v.WithLabelValues(kindList))
 }
 
 func TestGetProductMissThenHit(t *testing.T) {
@@ -146,6 +151,13 @@ func TestListProductsMissThenHit(t *testing.T) {
 	}
 	if _, ok := h.cache.values[keyAllProducts]; !ok {
 		t.Errorf("%s not cached", keyAllProducts)
+	}
+	// List reads are counted under key="list", not "product".
+	if hit, miss := testutil.ToFloat64(h.cat.hits.WithLabelValues(kindList)), testutil.ToFloat64(h.cat.misses.WithLabelValues(kindList)); hit != 1 || miss != 1 {
+		t.Errorf("list hits, misses = %v, %v; want 1, 1", hit, miss)
+	}
+	if n := sumKinds(h.cat.hits) + sumKinds(h.cat.misses); n != 2 {
+		t.Errorf("all hits and misses = %v, want 2 (none under product)", n)
 	}
 }
 

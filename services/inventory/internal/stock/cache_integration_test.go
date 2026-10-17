@@ -93,7 +93,7 @@ func TestReserveInvalidatesCachedStock(t *testing.T) {
 	if _, err := s.catalog.GetProduct(ctx, "sku-keyboard"); err != nil {
 		t.Fatal(err)
 	}
-	if hits := testutil.ToFloat64(s.catalog.hits); hits != 1 {
+	if hits := testutil.ToFloat64(s.catalog.hits.WithLabelValues(kindProduct)); hits != 1 {
 		t.Errorf("hits = %v, want 1", hits)
 	}
 

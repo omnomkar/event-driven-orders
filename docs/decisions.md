@@ -85,6 +85,7 @@ Alternative: skip failed records after logging them. That is simpler, but a skip
 The cache serves display reads only. A reservation never reads it: the authoritative check is the `SELECT ... FOR UPDATE` on the product rows inside the reserve transaction. A stale cached count can show a customer the wrong number for a moment, but it cannot cause an oversell.
 Staleness has two bounds. Normally a count is stale only between the stock commit and the delete that follows it. When the delete is lost (Redis unreachable at that moment), or in the classic cache-aside race (a reader misses, reads the old row, the writer commits and deletes, then the reader stores the old row), the entry is stale for at most one TTL.
 Redis is optional. If a cache call fails, the read goes to Postgres, the failure is logged and counted (`inventory_cache_errors_total`), and the cache is bypassed for 5 seconds so an outage costs one slow call instead of one per request. Each Redis call has a 250 ms deadline, which matters because a stopped Redis container takes about half a second to fail its DNS lookup. `/readyz` reports Redis as "degraded" but stays 200, so an orchestrator never takes inventory out of service for a cache outage. `CACHE_ENABLED=false` turns the cache off entirely, which the load test uses for its comparison.
+Measured with the load test (`loadtest/results/`), the cache did not make reads faster on one host: read p95 was 2.03 ms with it and 1.79 ms without it, because a primary-key read of a seven-row table in Postgres costs about as much as a Redis round trip, and with about 76 reservations per second deleting keys the hit ratio was about 76%. The cache is worth keeping for a catalog that is expensive to read or a database under read pressure; here its value is the design around it, not the speedup.
 Alternative: write-through (update the cached value inside the stock change). That keeps the cache warmer, but it couples every stock transaction to Redis, and two writers can still apply their cache writes in the opposite order from their commits.
 
 ## 13. Metrics: a few that answer specific questions
@@ -100,7 +101,19 @@ Every service exposes Prometheus metrics on its admin port, and the Compose stac
 | `kafka_consumer_lag{group,topic,partition}` | Is a consumer falling behind? |
 | `kafka_dlq_records_total{source_topic}` | Is anything being dead-lettered, and from where? |
 | `outbox_pending_rows` | Is a relay falling behind or failing to publish? |
-| `inventory_cache_{hits,misses,errors}_total` | Is the cache doing its job, and is Redis healthy? |
+| `inventory_cache_{hits,misses}_total{key}`, `inventory_cache_errors_total` | Is the cache doing its job (split by product keys and the list key), and is Redis healthy? |
 
 The HTTP route label is the ServeMux pattern (`/orders/{id}`), never the raw path. Every distinct label value is its own time series, so a path label would create one series per order. Saga outcomes are counted after the final transaction commits, so a redelivered reply, which deduplication skips, is never counted twice, and the saga duration is computed by the database clock (`clock_timestamp() - created_at`) in the same statement that sets the final status. Consumer lag is read every 10 seconds with admin requests (partition end offset minus the group's committed offset), so it measures what the group has durably finished, not what it has fetched.
 Alternative: OpenTelemetry metrics, or a third-party gRPC metrics package. Both work, but the interceptor and HTTP middleware here are a few dozen lines on top of `client_golang`, and the stack has only one consumer of the metrics.
+
+## 14. Card numbers will be stored with envelope encryption (planned)
+
+Today tokenization is a stub: the payment service validates the card, stores only a random token, the last four digits, and the brand, and never stores the number at all. That is enough for a simulated processor, but a real one has to keep the number so it can charge it later. The plan is envelope encryption with AWS KMS:
+
+1. For each card, call KMS `GenerateDataKey`, which returns a fresh 256-bit data key twice: in plaintext and encrypted under a KMS key that never leaves KMS.
+2. Encrypt the card number locally with AES-GCM under the plaintext data key, then discard the plaintext key.
+3. Store only the ciphertext, the GCM nonce, and the encrypted data key, next to the token. To charge, call KMS `Decrypt` on the data key and decrypt locally.
+
+Why not call KMS `Encrypt` on every card number directly? KMS `Encrypt` accepts at most 4 KB per call, every encryption and decryption is a network round trip with per-request cost and rate limits, and all data would be tied to one key forever. With envelope encryption the bulk cryptography is local AES-GCM, KMS is involved once per data key, and rotating the KMS key only means re-encrypting the small data keys, not every card. The KMS key policy can also grant `Decrypt` to the payment service alone, so a copy of the payments database is useless without that service's identity.
+The test that goes with it scans the payments database and the service logs for anything that looks like a card number and fails if it finds one, using only standard test numbers. The IAM policy would be scoped to the single key ARN.
+Alternative: a third-party vault or the processor's own tokenization. In production that is usually the right call, because it moves most of the PCI scope off the platform; here the point is to show the mechanism.
