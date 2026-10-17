@@ -144,6 +144,9 @@ jobs:
       - name: Check readiness and database role isolation
         run: make ready
 
+      - name: Check saga metrics after one order, and every Prometheus target
+        run: make metrics
+
       # Reuses the stack started above, so it adds about a minute instead of
       # a second image build. Runtime is dominated by payment's downtime, not
       # the order count; enough orders are needed that payment is still

@@ -51,6 +51,7 @@ func DeadLetter(client *kgo.Client, logger *slog.Logger) FailureHandler {
 		if err := client.ProduceSync(pctx, dl).FirstErr(); err != nil {
 			return fmt.Errorf("publish to %s: %w", dl.Topic, err)
 		}
+		dlqRecords.WithLabelValues(rec.Topic).Inc()
 		logger.Error("record dead-lettered",
 			"order_id", string(rec.Key),
 			"topic", rec.Topic,

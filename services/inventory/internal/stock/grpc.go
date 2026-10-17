@@ -11,16 +11,17 @@ import (
 	inventoryv1 "github.com/omnomkar/event-driven-orders/proto/gen/go/eventorders/inventory/v1"
 )
 
-// Server implements inventoryv1.InventoryServiceServer on top of a Store.
+// Server implements inventoryv1.InventoryServiceServer on top of a Catalog:
+// the Store directly, or a CachedCatalog in front of it.
 type Server struct {
 	inventoryv1.UnimplementedInventoryServiceServer
-	store  *Store
-	logger *slog.Logger
+	catalog Catalog
+	logger  *slog.Logger
 }
 
-// NewServer returns a gRPC server for store.
-func NewServer(store *Store, logger *slog.Logger) *Server {
-	return &Server{store: store, logger: logger}
+// NewServer returns a gRPC server that reads from catalog.
+func NewServer(catalog Catalog, logger *slog.Logger) *Server {
+	return &Server{catalog: catalog, logger: logger}
 }
 
 // GetProduct returns one product with its current stock.
@@ -28,7 +29,7 @@ func (s *Server) GetProduct(ctx context.Context, req *inventoryv1.GetProductRequ
 	if req.GetProductId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "product_id is required")
 	}
-	p, err := s.store.GetProduct(ctx, req.GetProductId())
+	p, err := s.catalog.GetProduct(ctx, req.GetProductId())
 	if errors.Is(err, ErrNotFound) {
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
@@ -41,7 +42,7 @@ func (s *Server) GetProduct(ctx context.Context, req *inventoryv1.GetProductRequ
 
 // ListProducts returns the whole catalog.
 func (s *Server) ListProducts(ctx context.Context, _ *inventoryv1.ListProductsRequest) (*inventoryv1.ListProductsResponse, error) {
-	products, err := s.store.ListProducts(ctx)
+	products, err := s.catalog.ListProducts(ctx)
 	if err != nil {
 		s.logger.Error("list products failed", "error", err)
 		return nil, status.Error(codes.Internal, "internal error")

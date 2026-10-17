@@ -1,7 +1,7 @@
 //go:build integration
 
-// Package testinfra starts real Postgres and Kafka containers for integration
-// tests. It is compiled only with the integration build tag.
+// Package testinfra starts real Postgres, Kafka, and Redis containers for
+// integration tests. It is compiled only with the integration build tag.
 package testinfra
 
 import (
@@ -16,6 +16,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	tckafka "github.com/testcontainers/testcontainers-go/modules/kafka"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -29,6 +30,8 @@ const (
 	// Kafka (3.5 here). The Compose stack runs apache/kafka 4.3.1; both speak
 	// the same client protocol for everything these tests use.
 	kafkaImage = "confluentinc/confluent-local:7.5.0"
+	// Same Redis image as the Compose stack.
+	redisImage = "redis:8.10.1-alpine"
 )
 
 // Postgres starts a Postgres container, applies migrations from fsys (if not
@@ -98,6 +101,29 @@ func Kafka(t *testing.T, topics ...string) []string {
 		}
 	}
 	return brokers
+}
+
+// Redis starts a Redis container and returns it with its host:port address.
+// It uses the generic container API (no Redis module needed). Tests that
+// simulate an outage call Stop on the returned container; it is removed
+// when the test ends either way.
+func Redis(t *testing.T) (*testcontainers.DockerContainer, string) {
+	t.Helper()
+	ctx := context.Background()
+
+	ctr, err := testcontainers.Run(ctx, redisImage,
+		testcontainers.WithExposedPorts("6379/tcp"),
+		testcontainers.WithWaitStrategy(wait.ForLog("Ready to accept connections")),
+	)
+	testcontainers.CleanupContainer(t, ctr)
+	if err != nil {
+		t.Fatalf("start redis: %v", err)
+	}
+	addr, err := ctr.PortEndpoint(ctx, "6379/tcp", "")
+	if err != nil {
+		t.Fatalf("redis address: %v", err)
+	}
+	return ctr, addr
 }
 
 // Consume reads records from topics, from the beginning, until it has n

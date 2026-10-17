@@ -40,6 +40,7 @@ func TestHandleWithRetry(t *testing.T) {
 			var (
 				failed   error
 				attempts int
+				after    int
 			)
 			cfg := ConsumerConfig{
 				MaxAttempts: 3,
@@ -48,6 +49,7 @@ func TestHandleWithRetry(t *testing.T) {
 					failed, attempts = err, n
 					return nil
 				},
+				AfterFailure: func(*kgo.Record) { after++ },
 			}
 
 			complete := handleWithRetry(context.Background(), &kgo.Record{Key: []byte("order-1")}, h, cfg, discardLogger())
@@ -63,6 +65,9 @@ func TestHandleWithRetry(t *testing.T) {
 			}
 			if complete != tt.wantComplete {
 				t.Errorf("complete = %v, want %v", complete, tt.wantComplete)
+			}
+			if wantAfter := map[bool]int{true: 1, false: 0}[tt.wantFailure]; after != wantAfter {
+				t.Errorf("AfterFailure called %d times, want %d", after, wantAfter)
 			}
 		})
 	}
@@ -91,7 +96,7 @@ func TestHandleWithRetryUsesBackoffSchedule(t *testing.T) {
 // fails), it is called again until it succeeds; the record is complete only
 // then, so it is never committed without being kept.
 func TestHandleWithRetryRetriesFailureHandler(t *testing.T) {
-	calls := 0
+	calls, after := 0, 0
 	cfg := ConsumerConfig{
 		MaxAttempts: 1,
 		Backoff:     func(int) time.Duration { return time.Millisecond },
@@ -102,14 +107,17 @@ func TestHandleWithRetryRetriesFailureHandler(t *testing.T) {
 			}
 			return nil
 		},
+		// Called once, only after the failure handler finally succeeds.
+		AfterFailure: func(*kgo.Record) { after++ },
 	}
 	h := func(context.Context, *kgo.Record) error { return Permanent(errors.New("bad payload")) }
 	if !handleWithRetry(context.Background(), &kgo.Record{}, h, cfg, discardLogger()) {
 		t.Error("record not complete after the failure handler succeeded")
 	}
-	if calls != 3 {
-		t.Errorf("failure handler called %d times, want 3", calls)
+	if calls != 3 || after != 1 {
+		t.Errorf("failure handler called %d times and AfterFailure %d; want 3 and 1", calls, after)
 	}
+	after = 0
 
 	// During shutdown a failing handler leaves the record uncommitted.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -119,6 +127,9 @@ func TestHandleWithRetryRetriesFailureHandler(t *testing.T) {
 	}
 	if handleWithRetry(ctx, &kgo.Record{}, h, cfg, discardLogger()) {
 		t.Error("record reported complete although the failure handler never succeeded")
+	}
+	if after != 0 {
+		t.Errorf("AfterFailure called %d times for a record the failure handler never took", after)
 	}
 }
 

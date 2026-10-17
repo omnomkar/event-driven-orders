@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	grpchealth "google.golang.org/grpc/health"
@@ -22,6 +24,7 @@ import (
 	"github.com/omnomkar/event-driven-orders/pkg/health"
 	"github.com/omnomkar/event-driven-orders/pkg/kafka"
 	"github.com/omnomkar/event-driven-orders/pkg/logging"
+	"github.com/omnomkar/event-driven-orders/pkg/metrics"
 	"github.com/omnomkar/event-driven-orders/pkg/outbox"
 	"github.com/omnomkar/event-driven-orders/pkg/postgres"
 	"github.com/omnomkar/event-driven-orders/pkg/server"
@@ -103,13 +106,16 @@ func run(logger *slog.Logger) error {
 	checks.Add("postgres", checkTimeout, pool.Ping)
 	checks.Add("kafka", checkTimeout, kafka.ReadyCheck(kc))
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(
+		metrics.NewGRPC(prometheus.DefaultRegisterer).UnaryInterceptor()))
 	healthServer := grpchealth.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
 	store := orders.NewStore(pool)
 	orderv1.RegisterOrderServiceServer(grpcServer, orders.NewServer(store, logger))
+	sagaMetrics := orders.NewSagaMetrics(prometheus.DefaultRegisterer)
+	consumerCfg.AfterFailure = func(*kgo.Record) { sagaMetrics.DeadLettered() }
 	saga, err := kafka.NewConsumer(kafkaCfg, consumerCfg,
-		store.SagaHandler(logger), logger)
+		store.SagaHandler(logger, sagaMetrics), logger)
 	if err != nil {
 		return err
 	}
@@ -130,6 +136,10 @@ func run(logger *slog.Logger) error {
 	})
 	g.Go(func() error {
 		return relay.Run(gctx)
+	})
+	g.Go(func() error {
+		kafka.RunLagGauge(gctx, kc, consumerCfg.Group, kafka.DefaultLagInterval, logger)
+		return nil
 	})
 	g.Go(func() error {
 		health.SyncGRPCHealth(gctx, checks, healthServer, healthSyncPeriod)

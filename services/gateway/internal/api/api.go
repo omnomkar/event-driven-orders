@@ -43,6 +43,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /orders", a.createOrder)
 	mux.HandleFunc("GET /orders/{id}", a.getOrder)
 	mux.HandleFunc("GET /products", a.listProducts)
+	mux.HandleFunc("GET /products/{id}", a.getProduct)
 }
 
 type itemJSON struct {
@@ -168,15 +169,33 @@ func (a *API) listProducts(w http.ResponseWriter, r *http.Request) {
 	}
 	products := make([]productJSON, len(resp.GetProducts()))
 	for i, p := range resp.GetProducts() {
-		products[i] = productJSON{
-			ProductID:         p.GetProductId(),
-			Name:              p.GetName(),
-			UnitPriceCents:    p.GetUnitPriceCents(),
-			Currency:          p.GetCurrency(),
-			AvailableQuantity: p.GetAvailableQuantity(),
-		}
+		products[i] = toProductJSON(p)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"products": products})
+}
+
+// getProduct returns one product with its current stock. The count is for
+// display and may lag a just-placed order by up to the cache TTL; the
+// reservation itself always checks the database.
+func (a *API) getProduct(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	resp, err := a.Inventory.GetProduct(ctx, &inventoryv1.GetProductRequest{ProductId: r.PathValue("id")})
+	if err != nil {
+		a.writeGRPCError(w, "get product", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toProductJSON(resp.GetProduct()))
+}
+
+func toProductJSON(p *inventoryv1.Product) productJSON {
+	return productJSON{
+		ProductID:         p.GetProductId(),
+		Name:              p.GetName(),
+		UnitPriceCents:    p.GetUnitPriceCents(),
+		Currency:          p.GetCurrency(),
+		AvailableQuantity: p.GetAvailableQuantity(),
+	}
 }
 
 // validate checks the request's shape. The services do the detailed checks

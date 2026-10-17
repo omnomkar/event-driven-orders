@@ -11,12 +11,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/omnomkar/event-driven-orders/pkg/config"
 	"github.com/omnomkar/event-driven-orders/pkg/health"
 	"github.com/omnomkar/event-driven-orders/pkg/logging"
+	"github.com/omnomkar/event-driven-orders/pkg/metrics"
 	"github.com/omnomkar/event-driven-orders/pkg/server"
 	inventoryv1 "github.com/omnomkar/event-driven-orders/proto/gen/go/eventorders/inventory/v1"
 	orderv1 "github.com/omnomkar/event-driven-orders/proto/gen/go/eventorders/order/v1"
@@ -83,8 +85,10 @@ func run(logger *slog.Logger) error {
 		Inventory: inventoryv1.NewInventoryServiceClient(conns["inventory"]),
 		Logger:    logger,
 	}).Register(mux)
+	// Every request, public or admin, is timed by its route pattern.
+	handler := metrics.NewHTTP(prometheus.DefaultRegisterer).Middleware(mux)
 	logger.Info("started", "http_addr", httpAddr)
-	err := server.RunHTTP(ctx, server.NewHTTP(httpAddr, mux), shutdownTimeout)
+	err := server.RunHTTP(ctx, server.NewHTTP(httpAddr, handler), shutdownTimeout)
 	logger.Info("stopped")
 	return err
 }

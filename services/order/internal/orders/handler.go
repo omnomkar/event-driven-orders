@@ -28,8 +28,11 @@ type reply struct {
 }
 
 // SagaHandler returns a kafka.Handler for the inventory.events and
-// payment.events topics. It is the saga orchestrator's entry point.
-func (s *Store) SagaHandler(logger *slog.Logger) kafka.Handler {
+// payment.events topics. It is the saga orchestrator's entry point. Each
+// saga that reaches a final state is recorded in m once, after its
+// transaction commits; a redelivered reply is skipped by dedup and never
+// counted twice.
+func (s *Store) SagaHandler(logger *slog.Logger, m *SagaMetrics) kafka.Handler {
 	return func(ctx context.Context, rec *kgo.Record) error {
 		r, err := decodeReply(rec)
 		if err != nil {
@@ -37,7 +40,7 @@ func (s *Store) SagaHandler(logger *slog.Logger) kafka.Handler {
 		}
 		log := logging.WithOrder(logger, r.orderID).With("message_id", r.messageID, "event", r.event.String())
 
-		to, err := s.Apply(ctx, r.messageID, r.orderID, r.event, r.data)
+		applied, err := s.Apply(ctx, r.messageID, r.orderID, r.event, r.data)
 		if errors.Is(err, dedup.ErrDuplicate) {
 			log.Info("duplicate reply skipped")
 			return nil
@@ -49,7 +52,8 @@ func (s *Store) SagaHandler(logger *slog.Logger) kafka.Handler {
 		if err != nil {
 			return err
 		}
-		log.Info("order status changed", "status", to)
+		m.finished(r.event, applied.To, applied.Elapsed)
+		log.Info("order status changed", "status", applied.To)
 		return nil
 	}
 }

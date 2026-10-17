@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/protobuf/proto"
 
@@ -52,7 +53,8 @@ func TestSagaHappyPath(t *testing.T) {
 	pool := testinfra.Postgres(t, migrations.FS)
 	store := NewStore(pool)
 	ctx := context.Background()
-	h := store.SagaHandler(testinfra.Logger())
+	m := NewSagaMetrics(prometheus.NewRegistry())
+	h := store.SagaHandler(testinfra.Logger(), m)
 
 	o, _, err := store.Create(ctx, validParams())
 	if err != nil {
@@ -108,6 +110,12 @@ func TestSagaHappyPath(t *testing.T) {
 	if want := []string{"PENDING", "INVENTORY_RESERVED", "CONFIRMED"}; !slices.Equal(history, want) {
 		t.Errorf("history %v, want %v", history, want)
 	}
+	if got := outcomes(m, OutcomeConfirmed, ReasonNone); got != 1 {
+		t.Errorf("confirmed outcomes = %v, want 1", got)
+	}
+	if got := durations(t, m, OutcomeConfirmed); got != 1 {
+		t.Errorf("confirmed durations = %d, want 1", got)
+	}
 }
 
 // Events that are not valid for the order's state are permanent failures
@@ -116,7 +124,8 @@ func TestSagaRejectsOutOfOrderEvents(t *testing.T) {
 	pool := testinfra.Postgres(t, migrations.FS)
 	store := NewStore(pool)
 	ctx := context.Background()
-	h := store.SagaHandler(testinfra.Logger())
+	m := NewSagaMetrics(prometheus.NewRegistry())
+	h := store.SagaHandler(testinfra.Logger(), m)
 
 	o, _, err := store.Create(ctx, validParams())
 	if err != nil {
@@ -186,7 +195,8 @@ func TestSagaPaymentFailureReleasesStockThenCancels(t *testing.T) {
 	pool := testinfra.Postgres(t, migrations.FS)
 	store := NewStore(pool)
 	ctx := context.Background()
-	h := store.SagaHandler(testinfra.Logger())
+	m := NewSagaMetrics(prometheus.NewRegistry())
+	h := store.SagaHandler(testinfra.Logger(), m)
 
 	o, _, err := store.Create(ctx, validParams())
 	if err != nil {
@@ -201,6 +211,9 @@ func TestSagaPaymentFailureReleasesStockThenCancels(t *testing.T) {
 	got, _ := store.Get(ctx, o.ID)
 	if got.Status != StatusCancelling || got.CancelReason != "card declined" {
 		t.Fatalf("after PaymentFailed: %+v; want CANCELLING with the reason", got)
+	}
+	if got := outcomes(m, OutcomeCancelled, ReasonPaymentFailed); got != 0 {
+		t.Errorf("payment_failed outcomes while CANCELLING = %v, want 0 (stock not released yet)", got)
 	}
 	release := outboxRows(t, pool, kafka.TopicInventoryCommands, o.ID)
 	var cmd eventsv1.InventoryCommand
@@ -226,6 +239,12 @@ func TestSagaPaymentFailureReleasesStockThenCancels(t *testing.T) {
 	if got := history(t, pool, o.ID); !slices.Equal(got, want) {
 		t.Errorf("history %v, want %v", got, want)
 	}
+	if got := outcomes(m, OutcomeCancelled, ReasonPaymentFailed); got != 1 {
+		t.Errorf("payment_failed outcomes = %v, want 1", got)
+	}
+	if got := durations(t, m, OutcomeCancelled); got != 1 {
+		t.Errorf("cancelled durations = %d, want 1", got)
+	}
 }
 
 // Out of stock cancels the order directly: nothing was reserved, so there is
@@ -234,7 +253,8 @@ func TestSagaStockRejectedCancelsWithoutPayment(t *testing.T) {
 	pool := testinfra.Postgres(t, migrations.FS)
 	store := NewStore(pool)
 	ctx := context.Background()
-	h := store.SagaHandler(testinfra.Logger())
+	m := NewSagaMetrics(prometheus.NewRegistry())
+	h := store.SagaHandler(testinfra.Logger(), m)
 
 	o, _, err := store.Create(ctx, validParams())
 	if err != nil {
@@ -257,6 +277,9 @@ func TestSagaStockRejectedCancelsWithoutPayment(t *testing.T) {
 	if want := []string{"PENDING", "CANCELLED"}; !slices.Equal(history(t, pool, o.ID), want) {
 		t.Errorf("history %v, want %v", history(t, pool, o.ID), want)
 	}
+	if oos, pf := outcomes(m, OutcomeCancelled, ReasonOutOfStock), outcomes(m, OutcomeCancelled, ReasonPaymentFailed); oos != 1 || pf != 0 {
+		t.Errorf("out_of_stock, payment_failed outcomes = %v, %v; want 1, 0", oos, pf)
+	}
 }
 
 // A redelivered reply (same message_id) is skipped: it returns nil so the
@@ -265,7 +288,8 @@ func TestSagaSkipsRedeliveredReply(t *testing.T) {
 	pool := testinfra.Postgres(t, migrations.FS)
 	store := NewStore(pool)
 	ctx := context.Background()
-	h := store.SagaHandler(testinfra.Logger())
+	m := NewSagaMetrics(prometheus.NewRegistry())
+	h := store.SagaHandler(testinfra.Logger(), m)
 
 	o, _, err := store.Create(ctx, validParams())
 	if err != nil {
@@ -282,6 +306,17 @@ func TestSagaSkipsRedeliveredReply(t *testing.T) {
 	}
 	if want := []string{"PENDING", "INVENTORY_RESERVED"}; !slices.Equal(history(t, pool, o.ID), want) {
 		t.Errorf("history %v, want %v", history(t, pool, o.ID), want)
+	}
+
+	// The final reply delivered twice confirms, and is counted, once.
+	confirm := paymentSucceeded(t, o.ID)
+	for i := range 2 {
+		if err := h(ctx, confirm); err != nil {
+			t.Fatalf("PaymentSucceeded delivery %d: %v", i+1, err)
+		}
+	}
+	if got := outcomes(m, OutcomeConfirmed, ReasonNone); got != 1 {
+		t.Errorf("confirmed outcomes after a redelivery = %v, want 1", got)
 	}
 
 	// A reply with no message_id cannot be deduplicated, so it is refused.

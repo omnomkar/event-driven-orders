@@ -10,7 +10,7 @@ COMPOSE_ENV := deploy/compose/.env
 # Every directory containing a go.mod, excluding vendored or hidden paths.
 MODULES := $(shell find . -name go.mod -not -path './.*' -exec dirname {} \; | sort)
 
-.PHONY: up down proto lint test test-integration ready dlq dlq-replay chaos
+.PHONY: up down proto lint test test-integration ready metrics dlq dlq-replay chaos
 
 ## up: build images and start the local stack, waiting until every container is healthy
 up: $(COMPOSE_ENV)
@@ -44,6 +44,10 @@ test-integration:
 ## ready: check /readyz on every service and verify database role isolation
 ready:
 	bash deploy/compose/check-ready.sh
+
+## metrics: place one order and check the saga metrics and every Prometheus target (stack must be up)
+metrics:
+	bash scripts/metrics-check.sh
 
 ## dlq: print every record in every dead-letter topic (stack must be up)
 dlq:

@@ -78,3 +78,29 @@ Retrying in place has a cost: while one record waits for its next attempt, every
 A dead-letter record is handled by a person: `make dlq` lists every dead-letter record with its order ID, error, and source position. Once the cause is fixed (a bug deployed, a dependency restored), `make dlq-replay TOPIC=<topic>.dlq` publishes the records back to their source topic. Replay is safe because consumers deduplicate by `message_id`: a record whose effects were in fact applied is skipped, and replaying the same record twice has no extra effect. Replay progress is committed under its own consumer group, so a second replay publishes only records that arrived since the first.
 Alternative: skip failed records after logging them. That is simpler, but a skipped saga reply leaves its order stuck with no way to resume it.
 
+
+## 12. Catalog reads are cached cache-aside, and the cache never decides stock
+
+`GetProduct` and `ListProducts` in the inventory service read Redis first (`product:<id>`, `products:all`). On a miss they read Postgres and store the result with a TTL (30 seconds by default, `CACHE_TTL`). After a reservation or a release commits, the service deletes the changed products' keys and `products:all`. It deletes rather than writes the new value, so it can never put an older value over a newer one, and the next read simply loads the committed row.
+The cache serves display reads only. A reservation never reads it: the authoritative check is the `SELECT ... FOR UPDATE` on the product rows inside the reserve transaction. A stale cached count can show a customer the wrong number for a moment, but it cannot cause an oversell.
+Staleness has two bounds. Normally a count is stale only between the stock commit and the delete that follows it. When the delete is lost (Redis unreachable at that moment), or in the classic cache-aside race (a reader misses, reads the old row, the writer commits and deletes, then the reader stores the old row), the entry is stale for at most one TTL.
+Redis is optional. If a cache call fails, the read goes to Postgres, the failure is logged and counted (`inventory_cache_errors_total`), and the cache is bypassed for 5 seconds so an outage costs one slow call instead of one per request. Each Redis call has a 250 ms deadline, which matters because a stopped Redis container takes about half a second to fail its DNS lookup. `/readyz` reports Redis as "degraded" but stays 200, so an orchestrator never takes inventory out of service for a cache outage. `CACHE_ENABLED=false` turns the cache off entirely, which the load test uses for its comparison.
+Alternative: write-through (update the cached value inside the stock change). That keeps the cache warmer, but it couples every stock transaction to Redis, and two writers can still apply their cache writes in the opposite order from their commits.
+
+## 13. Metrics: a few that answer specific questions
+
+Every service exposes Prometheus metrics on its admin port, and the Compose stack runs Prometheus scraping all four every 5 seconds. Each metric answers one operational question:
+
+| Metric | Question it answers |
+| --- | --- |
+| `http_server_request_duration_seconds{route,method,status}` (gateway) | How fast is the public API, per route, and how many requests fail? |
+| `grpc_server_handling_seconds{method,code}` (order, payment, inventory) | Which backend call is slow or failing? |
+| `saga_outcomes_total{outcome,reason}` (order) | How many orders end confirmed, cancelled for out of stock, cancelled for a failed payment, or stuck behind a dead-lettered reply? |
+| `saga_duration_seconds{outcome}` (order) | How long does a customer wait from placing an order to a final answer? |
+| `kafka_consumer_lag{group,topic,partition}` | Is a consumer falling behind? |
+| `kafka_dlq_records_total{source_topic}` | Is anything being dead-lettered, and from where? |
+| `outbox_pending_rows` | Is a relay falling behind or failing to publish? |
+| `inventory_cache_{hits,misses,errors}_total` | Is the cache doing its job, and is Redis healthy? |
+
+The HTTP route label is the ServeMux pattern (`/orders/{id}`), never the raw path. Every distinct label value is its own time series, so a path label would create one series per order. Saga outcomes are counted after the final transaction commits, so a redelivered reply, which deduplication skips, is never counted twice, and the saga duration is computed by the database clock (`clock_timestamp() - created_at`) in the same statement that sets the final status. Consumer lag is read every 10 seconds with admin requests (partition end offset minus the group's committed offset), so it measures what the group has durably finished, not what it has fetched.
+Alternative: OpenTelemetry metrics, or a third-party gRPC metrics package. Both work, but the interceptor and HTTP middleware here are a few dozen lines on top of `client_golang`, and the stack has only one consumer of the metrics.

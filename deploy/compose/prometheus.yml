@@ -1,0 +1,17 @@
+# Prometheus for the local stack: scrapes /metrics on every service's admin
+# port. The gateway serves its admin endpoints on its public port.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: services
+    static_configs:
+      - targets: ["gateway:8080"]
+        labels: {service: gateway}
+      - targets: ["order:8081"]
+        labels: {service: order}
+      - targets: ["payment:8082"]
+        labels: {service: payment}
+      - targets: ["inventory:8083"]
+        labels: {service: inventory}

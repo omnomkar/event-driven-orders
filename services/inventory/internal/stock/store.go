@@ -71,12 +71,28 @@ type PricedLine struct {
 
 // Store reads and writes the inventory service's own database.
 type Store struct {
-	pool *pgxpool.Pool
+	pool          *pgxpool.Pool
+	onStockChange func(ctx context.Context, productIDs []string)
 }
 
 // NewStore returns a Store backed by pool.
 func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
+}
+
+// OnStockChange sets a function that Store calls after every transaction
+// that changed stock has committed, with the IDs of the products it changed.
+// The cache uses it to delete those products' entries. It is called only
+// after commit, so a rolled-back change never invalidates anything, and a
+// reader can never re-cache the old value from before the commit.
+func (s *Store) OnStockChange(f func(ctx context.Context, productIDs []string)) {
+	s.onStockChange = f
+}
+
+func (s *Store) stockChanged(ctx context.Context, productIDs []string) {
+	if s.onStockChange != nil && len(productIDs) > 0 {
+		s.onStockChange(ctx, productIDs)
+	}
 }
 
 // Rejection explains why an order could not be reserved. Its reason ends up
@@ -195,6 +211,13 @@ func (s *Store) Reserve(ctx context.Context, messageID, orderID string, lines []
 	if err != nil {
 		return nil, nil, fmt.Errorf("reserve stock for order %s: %w", orderID, err)
 	}
+	if res != nil {
+		ids := make([]string, len(res.Lines))
+		for i, l := range res.Lines {
+			ids[i] = l.ProductID
+		}
+		s.stockChanged(ctx, ids)
+	}
 	return res, rej, nil
 }
 
@@ -249,7 +272,10 @@ const (
 // never made, nothing changes but StockReleased is still sent, so the saga
 // can always finish cancelling the order.
 func (s *Store) Release(ctx context.Context, messageID, orderID string) (ReleaseResult, error) {
-	var result ReleaseResult
+	var (
+		result  ReleaseResult
+		changed []string
+	)
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := dedup.Claim(ctx, tx, messageID); err != nil {
 			return err
@@ -267,11 +293,15 @@ func (s *Store) Release(ctx context.Context, messageID, orderID string) (Release
 			result = Released
 			// Lock the products in ID order, the same order Reserve uses, so
 			// a release and a reservation cannot deadlock.
-			if _, err := tx.Exec(ctx, `
-				SELECT 1 FROM products
+			rows, err := tx.Query(ctx, `
+				SELECT id FROM products
 				WHERE id IN (SELECT product_id FROM reservation_lines WHERE order_id = $1)
 				ORDER BY id
-				FOR UPDATE`, orderID); err != nil {
+				FOR UPDATE`, orderID)
+			if err != nil {
+				return fmt.Errorf("lock products: %w", err)
+			}
+			if changed, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
 				return fmt.Errorf("lock products: %w", err)
 			}
 			if _, err := tx.Exec(ctx, `
@@ -296,6 +326,7 @@ func (s *Store) Release(ctx context.Context, messageID, orderID string) (Release
 	if err != nil {
 		return "", fmt.Errorf("release stock for order %s: %w", orderID, err)
 	}
+	s.stockChanged(ctx, changed)
 	return result, nil
 }
 

@@ -24,8 +24,9 @@ func hang(ctx context.Context) error {
 
 func TestRegistryRun(t *testing.T) {
 	type entry struct {
-		name string
-		fn   CheckFunc
+		name     string
+		fn       CheckFunc
+		optional bool
 	}
 	tests := []struct {
 		name       string
@@ -40,28 +41,50 @@ func TestRegistryRun(t *testing.T) {
 		},
 		{
 			name:       "all pass",
-			checks:     []entry{{"postgres", pass}, {"kafka", pass}},
+			checks:     []entry{{"postgres", pass, false}, {"kafka", pass, false}},
 			wantStatus: StatusOK,
 			wantChecks: map[string]string{"postgres": StatusOK, "kafka": StatusOK},
 		},
 		{
 			name:       "one fails",
-			checks:     []entry{{"postgres", pass}, {"kafka", fail}},
+			checks:     []entry{{"postgres", pass, false}, {"kafka", fail, false}},
 			wantStatus: StatusFail,
 			wantChecks: map[string]string{"postgres": StatusOK, "kafka": StatusFail},
 		},
 		{
 			name:       "timeout fails",
-			checks:     []entry{{"redis", hang}},
+			checks:     []entry{{"redis", hang, false}},
 			wantStatus: StatusFail,
 			wantChecks: map[string]string{"redis": StatusFail},
+		},
+		{
+			name:       "optional failure degrades",
+			checks:     []entry{{"postgres", pass, false}, {"redis", fail, true}},
+			wantStatus: StatusDegraded,
+			wantChecks: map[string]string{"postgres": StatusOK, "redis": StatusDegraded},
+		},
+		{
+			name:       "optional pass is ok",
+			checks:     []entry{{"postgres", pass, false}, {"redis", pass, true}},
+			wantStatus: StatusOK,
+			wantChecks: map[string]string{"postgres": StatusOK, "redis": StatusOK},
+		},
+		{
+			name:       "required failure wins over degraded",
+			checks:     []entry{{"redis", fail, true}, {"postgres", fail, false}},
+			wantStatus: StatusFail,
+			wantChecks: map[string]string{"postgres": StatusFail, "redis": StatusDegraded},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := NewRegistry()
 			for _, c := range tt.checks {
-				r.Add(c.name, 50*time.Millisecond, c.fn)
+				if c.optional {
+					r.AddOptional(c.name, 50*time.Millisecond, c.fn)
+				} else {
+					r.Add(c.name, 50*time.Millisecond, c.fn)
+				}
 			}
 			got := r.Run(context.Background())
 			if got.Status != tt.wantStatus {
@@ -75,7 +98,7 @@ func TestRegistryRun(t *testing.T) {
 				if res.Status != want {
 					t.Errorf("check %q status = %q, want %q", name, res.Status, want)
 				}
-				if (res.Error != "") != (want == StatusFail) {
+				if (res.Error != "") != (want != StatusOK) {
 					t.Errorf("check %q error = %q, want error only on failure", name, res.Error)
 				}
 			}
@@ -139,6 +162,27 @@ func TestReadyzBodyIsValidJSON(t *testing.T) {
 	}
 	if report.Ready() || report.Checks["kafka"].Status != StatusFail {
 		t.Errorf("report = %+v, want kafka failing", report)
+	}
+}
+
+// A degraded service is still ready: /readyz answers 200 and names the
+// optional check that failed.
+func TestReadyzDegradedIsReady(t *testing.T) {
+	r := NewRegistry()
+	r.Add("postgres", time.Second, pass)
+	r.AddOptional("redis", time.Second, fail)
+	rec := httptest.NewRecorder()
+	r.ReadyHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("code = %d, want 200", rec.Code)
+	}
+	var report Report
+	if err := json.Unmarshal(rec.Body.Bytes(), &report); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if !report.Ready() || report.Status != StatusDegraded || report.Checks["redis"].Status != StatusDegraded {
+		t.Errorf("report = %+v, want ready, degraded, with redis degraded", report)
 	}
 }
 

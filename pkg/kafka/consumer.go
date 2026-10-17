@@ -60,6 +60,9 @@ type ConsumerConfig struct {
 	// OnFailure receives records that failed permanently or ran out of
 	// attempts. Default: DeadLetter, which publishes them to Topic + ".dlq".
 	OnFailure FailureHandler
+	// AfterFailure, if set, is called once OnFailure has taken a record,
+	// just before its offset is committed. Services use it for metrics.
+	AfterFailure func(rec *kgo.Record)
 	// SessionTimeout is how long the group waits for a silent member before
 	// giving its partitions to others. A shorter timeout means a crashed
 	// instance's partitions move sooner. Default: franz-go's 45s.
@@ -224,6 +227,9 @@ func handleWithRetry(ctx context.Context, rec *kgo.Record, h Handler, cfg Consum
 	for try := 1; ; try++ {
 		ferr := cfg.OnFailure(ctx, rec, attempt, err)
 		if ferr == nil {
+			if cfg.AfterFailure != nil {
+				cfg.AfterFailure(rec)
+			}
 			return true
 		}
 		if ctx.Err() != nil {

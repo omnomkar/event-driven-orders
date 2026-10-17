@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -23,6 +24,7 @@ import (
 	"github.com/omnomkar/event-driven-orders/pkg/health"
 	"github.com/omnomkar/event-driven-orders/pkg/kafka"
 	"github.com/omnomkar/event-driven-orders/pkg/logging"
+	"github.com/omnomkar/event-driven-orders/pkg/metrics"
 	"github.com/omnomkar/event-driven-orders/pkg/outbox"
 	"github.com/omnomkar/event-driven-orders/pkg/postgres"
 	"github.com/omnomkar/event-driven-orders/pkg/server"
@@ -36,6 +38,9 @@ const (
 	defaultAdminAddr = ":8083"
 	checkTimeout     = 2 * time.Second
 	healthSyncPeriod = 5 * time.Second
+	// The cache is optional, so a slow or dead Redis must cost little: a
+	// failed cache call gives up quickly and the read goes to Postgres.
+	redisTimeout = 250 * time.Millisecond
 )
 
 func main() {
@@ -57,7 +62,14 @@ func run(logger *slog.Logger) error {
 	adminAddr := cfg.String("ADMIN_ADDR", defaultAdminAddr)
 	databaseURL := cfg.Required("DATABASE_URL")
 	brokers := cfg.RequiredList("KAFKA_BROKERS")
-	redisAddr := cfg.Required("REDIS_ADDR")
+	// CACHE_ENABLED=false serves every read from Postgres; the load test
+	// uses it for the with-and-without comparison.
+	cacheEnabled := cfg.Bool("CACHE_ENABLED", true)
+	cacheTTL := cfg.Duration("CACHE_TTL", 30*time.Second)
+	var redisAddr string
+	if cacheEnabled {
+		redisAddr = cfg.Required("REDIS_ADDR")
+	}
 	shutdownTimeout := cfg.Duration("SHUTDOWN_TIMEOUT", 10*time.Second)
 	migrateTimeout := cfg.Duration("MIGRATE_TIMEOUT", 60*time.Second)
 	outboxInterval := cfg.Duration("OUTBOX_POLL_INTERVAL", 200*time.Millisecond)
@@ -96,7 +108,34 @@ func run(logger *slog.Logger) error {
 	}
 	defer kc.Close()
 
+	checks := health.NewRegistry()
+	checks.Add("postgres", checkTimeout, pool.Ping)
+	checks.Add("kafka", checkTimeout, kafka.ReadyCheck(kc))
+
 	store := stock.NewStore(pool)
+	var catalog stock.Catalog = store
+	if cacheEnabled {
+		// go-redis connects lazily, like pgxpool. Retries are off: a cache
+		// miss is cheaper than waiting on a struggling Redis.
+		rdb := redis.NewClient(&redis.Options{
+			Addr:         redisAddr,
+			DialTimeout:  redisTimeout,
+			ReadTimeout:  redisTimeout,
+			WriteTimeout: redisTimeout,
+			MaxRetries:   -1,
+		})
+		defer func() { _ = rdb.Close() }()
+		cached := stock.NewCachedCatalog(store, stock.NewRedisCache(rdb, redisTimeout), cacheTTL, prometheus.DefaultRegisterer, logger)
+		store.OnStockChange(cached.Invalidate)
+		catalog = cached
+		// Optional: with Redis down, inventory reads Postgres and stays
+		// ready; /readyz shows redis as "degraded".
+		checks.AddOptional("redis", checkTimeout, func(ctx context.Context) error {
+			return rdb.Ping(ctx).Err()
+		})
+	}
+	logger.Info("catalog cache", "enabled", cacheEnabled, "ttl", cacheTTL.String())
+
 	consumer, err := kafka.NewConsumer(kafkaCfg, consumerCfg,
 		store.CommandHandler(logger), logger)
 	if err != nil {
@@ -105,21 +144,11 @@ func run(logger *slog.Logger) error {
 	defer consumer.Close()
 	relay := outbox.NewRelay(pool, kc, outbox.RelayConfig{PollInterval: outboxInterval}, logger)
 
-	// go-redis connects lazily, like pgxpool.
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
-	defer func() { _ = rdb.Close() }()
-
-	checks := health.NewRegistry()
-	checks.Add("postgres", checkTimeout, pool.Ping)
-	checks.Add("kafka", checkTimeout, kafka.ReadyCheck(kc))
-	checks.Add("redis", checkTimeout, func(ctx context.Context) error {
-		return rdb.Ping(ctx).Err()
-	})
-
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(
+		metrics.NewGRPC(prometheus.DefaultRegisterer).UnaryInterceptor()))
 	healthServer := grpchealth.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
-	inventoryv1.RegisterInventoryServiceServer(grpcServer, stock.NewServer(store, logger))
+	inventoryv1.RegisterInventoryServiceServer(grpcServer, stock.NewServer(catalog, logger))
 
 	// errgroup runs each server in its own goroutine. If one fails, gctx is
 	// cancelled so the others shut down too; Wait returns the first error.
@@ -135,6 +164,10 @@ func run(logger *slog.Logger) error {
 	})
 	g.Go(func() error {
 		return relay.Run(gctx)
+	})
+	g.Go(func() error {
+		kafka.RunLagGauge(gctx, kc, consumerCfg.Group, kafka.DefaultLagInterval, logger)
+		return nil
 	})
 	g.Go(func() error {
 		health.SyncGRPCHealth(gctx, checks, healthServer, healthSyncPeriod)

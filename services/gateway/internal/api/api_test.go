@@ -65,6 +65,15 @@ type fakeInventory struct {
 	inventoryv1.InventoryServiceClient
 }
 
+func (fakeInventory) GetProduct(_ context.Context, in *inventoryv1.GetProductRequest, _ ...grpc.CallOption) (*inventoryv1.GetProductResponse, error) {
+	if in.GetProductId() != "sku-cable" {
+		return nil, status.Error(codes.NotFound, "product not found")
+	}
+	return &inventoryv1.GetProductResponse{Product: &inventoryv1.Product{
+		ProductId: "sku-cable", Name: "USB-C cable", UnitPriceCents: 999, Currency: "USD", AvailableQuantity: 10,
+	}}, nil
+}
+
 func (fakeInventory) ListProducts(context.Context, *inventoryv1.ListProductsRequest, ...grpc.CallOption) (*inventoryv1.ListProductsResponse, error) {
 	return &inventoryv1.ListProductsResponse{Products: []*inventoryv1.Product{
 		{ProductId: "sku-cable", Name: "USB-C cable", UnitPriceCents: 999, Currency: "USD", AvailableQuantity: 10},
@@ -227,5 +236,16 @@ func TestListProducts(t *testing.T) {
 	rec := newHarness().do("GET", "/products", "", nil)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"product_id":"sku-cable"`) {
 		t.Errorf("status %d body %s", rec.Code, rec.Body)
+	}
+}
+
+func TestGetProduct(t *testing.T) {
+	h := newHarness()
+	rec := h.do("GET", "/products/sku-cable", "", nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"available_quantity":10`) {
+		t.Errorf("status %d body %s", rec.Code, rec.Body)
+	}
+	if rec := h.do("GET", "/products/sku-missing", "", nil); rec.Code != http.StatusNotFound {
+		t.Errorf("unknown product: status %d, want 404", rec.Code)
 	}
 }

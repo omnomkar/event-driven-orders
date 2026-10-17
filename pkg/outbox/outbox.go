@@ -27,9 +27,18 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/protobuf/proto"
 )
+
+// pendingRows is registered with the default Prometheus registry. Each
+// service has one outbox and one relay, so it needs no labels.
+var pendingRows = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "outbox_pending_rows",
+	Help: "Outbox rows not yet published to Kafka.",
+})
 
 // Add serializes msg and stores it in the outbox inside tx, the caller's
 // transaction. It never opens or commits a transaction of its own, so the
@@ -57,6 +66,9 @@ type RelayConfig struct {
 	BatchSize int
 	// ProduceTimeout bounds one batch's publish to Kafka. Default 10s.
 	ProduceTimeout time.Duration
+	// PendingInterval is how often the relay counts unsent rows for the
+	// outbox_pending_rows gauge. Default 5s.
+	PendingInterval time.Duration
 }
 
 // Relay publishes unsent outbox rows to Kafka and marks them sent.
@@ -79,6 +91,9 @@ func NewRelay(pool *pgxpool.Pool, client *kgo.Client, cfg RelayConfig, logger *s
 	if cfg.ProduceTimeout <= 0 {
 		cfg.ProduceTimeout = 10 * time.Second
 	}
+	if cfg.PendingInterval <= 0 {
+		cfg.PendingInterval = 5 * time.Second
+	}
 	return &Relay{pool: pool, client: client, cfg: cfg, logger: logger.With("component", "outbox_relay")}
 }
 
@@ -86,7 +101,14 @@ func NewRelay(pool *pgxpool.Pool, client *kgo.Client, cfg RelayConfig, logger *s
 // another poll, so a backlog drains without waiting for the interval. Errors
 // are logged and retried on the next poll; they never stop the relay.
 func (r *Relay) Run(ctx context.Context) error {
+	var lastCount time.Time
 	for {
+		if time.Since(lastCount) >= r.cfg.PendingInterval {
+			lastCount = time.Now()
+			if err := r.updatePending(ctx); err != nil && ctx.Err() == nil {
+				r.logger.Warn("count pending outbox rows failed", "error", err)
+			}
+		}
 		n, err := r.RelayOnce(ctx)
 		if err != nil && ctx.Err() == nil {
 			r.logger.Error("relay batch failed", "error", err, "published", n)
@@ -100,6 +122,17 @@ func (r *Relay) Run(ctx context.Context) error {
 		case <-time.After(r.cfg.PollInterval):
 		}
 	}
+}
+
+// updatePending sets outbox_pending_rows. The partial index on unsent rows
+// keeps the count cheap even when the table holds many sent rows.
+func (r *Relay) updatePending(ctx context.Context) error {
+	var n int64
+	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE sent_at IS NULL`).Scan(&n); err != nil {
+		return fmt.Errorf("count unsent outbox rows: %w", err)
+	}
+	pendingRows.Set(float64(n))
+	return nil
 }
 
 // RelayOnce publishes one batch of unsent rows and returns how many it

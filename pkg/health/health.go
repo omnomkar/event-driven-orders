@@ -20,6 +20,8 @@ type check struct {
 	name    string
 	timeout time.Duration
 	fn      CheckFunc
+	// optional checks never fail readiness; see AddOptional.
+	optional bool
 }
 
 // Registry holds the readiness checks for a service. Add every check before
@@ -38,10 +40,20 @@ func (r *Registry) Add(name string, timeout time.Duration, fn CheckFunc) {
 	r.checks = append(r.checks, check{name: name, timeout: timeout, fn: fn})
 }
 
+// AddOptional registers a check for a dependency the service can run
+// without, such as a cache it falls back from. When it fails, the check and
+// the report say "degraded", but the service still reports ready.
+func (r *Registry) AddOptional(name string, timeout time.Duration, fn CheckFunc) {
+	r.checks = append(r.checks, check{name: name, timeout: timeout, fn: fn, optional: true})
+}
+
 // Status values used in reports.
 const (
-	StatusOK   = "ok"
-	StatusFail = "fail"
+	StatusOK = "ok"
+	// StatusDegraded means only optional checks failed: the service is
+	// ready but running without something it would normally use.
+	StatusDegraded = "degraded"
+	StatusFail     = "fail"
 )
 
 // CheckResult is the outcome of one check.
@@ -57,9 +69,10 @@ type Report struct {
 	Checks map[string]CheckResult `json:"checks"`
 }
 
-// Ready reports whether every check passed.
+// Ready reports whether every required check passed. Optional checks may
+// have failed (StatusDegraded).
 func (r Report) Ready() bool {
-	return r.Status == StatusOK
+	return r.Status == StatusOK || r.Status == StatusDegraded
 }
 
 // Run executes every check in parallel, each under its own timeout, and
@@ -76,10 +89,18 @@ func (r *Registry) Run(ctx context.Context) Report {
 
 	report := Report{Status: StatusOK, Checks: make(map[string]CheckResult, len(r.checks))}
 	for i, c := range r.checks {
-		report.Checks[c.name] = results[i]
-		if results[i].Status != StatusOK {
+		res := results[i]
+		switch {
+		case res.Status == StatusOK:
+		case c.optional:
+			res.Status = StatusDegraded
+			if report.Status == StatusOK {
+				report.Status = StatusDegraded
+			}
+		default:
 			report.Status = StatusFail
 		}
+		report.Checks[c.name] = res
 	}
 	return report
 }
@@ -107,8 +128,8 @@ func LiveHandler() http.Handler {
 	})
 }
 
-// ReadyHandler serves /readyz: 200 when every check passes, 503 otherwise,
-// with a JSON body listing each check.
+// ReadyHandler serves /readyz: 200 when every required check passes, 503
+// otherwise, with a JSON body listing each check.
 func (r *Registry) ReadyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		report := r.Run(req.Context())

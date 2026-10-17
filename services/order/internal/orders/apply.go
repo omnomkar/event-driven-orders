@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -25,6 +26,15 @@ type EventData struct {
 	Reason string
 }
 
+// Applied is the result of a committed Apply.
+type Applied struct {
+	To Status
+	// Elapsed is the time since the order was created, read from the
+	// database clock in the same statement that set To, so it does not
+	// depend on this host's clock agreeing with the database's.
+	Elapsed time.Duration
+}
+
 // Apply moves the order through the saga in response to e, the reply with
 // ID messageID. In one transaction it records messageID as processed, locks
 // the order row, asks next() for the new status and commands, updates the
@@ -34,8 +44,11 @@ type EventData struct {
 //
 // The row lock (SELECT ... FOR UPDATE) serializes concurrent events for the
 // same order, so two replies can never both act on the same old status.
-func (s *Store) Apply(ctx context.Context, messageID, orderID string, e Event, data EventData) (Status, error) {
-	var to Status
+func (s *Store) Apply(ctx context.Context, messageID, orderID string, e Event, data EventData) (Applied, error) {
+	var (
+		to      Status
+		elapsed float64
+	)
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := dedup.Claim(ctx, tx, messageID); err != nil {
 			return err
@@ -73,10 +86,12 @@ func (s *Store) Apply(ctx context.Context, messageID, orderID string, e Event, d
 		if data.Reason != "" && (to == StatusCancelling || to == StatusCancelled) {
 			cancelReason = &data.Reason
 		}
-		if _, err := tx.Exec(ctx, `
+		if err := tx.QueryRow(ctx, `
 			UPDATE orders
 			SET status = $2, total_cents = $3, currency = $4, cancel_reason = $5, updated_at = now()
-			WHERE id = $1`, orderID, to, total, currency, cancelReason); err != nil {
+			WHERE id = $1
+			RETURNING EXTRACT(EPOCH FROM clock_timestamp() - created_at)::float8`,
+			orderID, to, total, currency, cancelReason).Scan(&elapsed); err != nil {
 			return fmt.Errorf("update order: %w", err)
 		}
 		if err := recordStatus(ctx, tx, orderID, to); err != nil {
@@ -94,9 +109,9 @@ func (s *Store) Apply(ctx context.Context, messageID, orderID string, e Event, d
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("apply %s to order %s: %w", e, orderID, err)
+		return Applied{}, fmt.Errorf("apply %s to order %s: %w", e, orderID, err)
 	}
-	return to, nil
+	return Applied{To: to, Elapsed: time.Duration(elapsed * float64(time.Second))}, nil
 }
 
 // buildCommand turns a saga command into the Kafka message that carries it.

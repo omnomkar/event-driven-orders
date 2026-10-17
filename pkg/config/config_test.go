@@ -88,6 +88,33 @@ func TestInt(t *testing.T) {
 	}
 }
 
+func TestBool(t *testing.T) {
+	tests := []struct {
+		name    string
+		vars    map[string]string
+		def     bool
+		want    bool
+		wantErr bool
+	}{
+		{"true", map[string]string{"B": "true"}, false, true, false},
+		{"false overrides default", map[string]string{"B": "false"}, true, false, false},
+		{"numeric", map[string]string{"B": "0"}, true, false, false},
+		{"unset uses default", nil, true, true, false},
+		{"invalid", map[string]string{"B": "yes please"}, true, true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l := NewWithLookup(env(tt.vars))
+			if got := l.Bool("B", tt.def); got != tt.want {
+				t.Errorf("Bool() = %v, want %v", got, tt.want)
+			}
+			if (l.Err() != nil) != tt.wantErr {
+				t.Errorf("Err() = %v, wantErr %v", l.Err(), tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestDuration(t *testing.T) {
 	tests := []struct {
 		name    string

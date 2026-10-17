@@ -2,6 +2,7 @@
 # Used as-is for local development and in CI.
 #   make up      build and start, waiting until every container is healthy
 #   make ready   check /readyz on every service and database role isolation
+#   make metrics place one order and check the saga metrics and Prometheus
 #   make down    stop and remove containers and volumes
 
 name: eventorders
@@ -148,6 +149,10 @@ services:
       <<: *service-env
       DATABASE_URL: postgres://inventory_svc:${INVENTORY_DB_PASSWORD}@postgres:5432/inventory?sslmode=disable
       REDIS_ADDR: redis:6379
+      # Catalog reads go through Redis (cache-aside) unless disabled; the
+      # load test sets CACHE_ENABLED=false for its comparison run.
+      CACHE_ENABLED: ${CACHE_ENABLED:-true}
+      CACHE_TTL: 30s
     ports:
       - "8083:8083"
     depends_on:
@@ -180,6 +185,23 @@ services:
     healthcheck:
       <<: *service-healthcheck
       test: ["CMD", "/gateway", "healthcheck"]
+
+  # Scrapes every service's /metrics every 5s. UI and API on localhost:9090.
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=1d
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    healthcheck:
+      # The image is busybox-based, so wget is available.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
 
 volumes:
   postgres-data:

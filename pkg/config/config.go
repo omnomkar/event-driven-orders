@@ -66,6 +66,21 @@ func (l *Loader) Int(key string, def int) int {
 	return n
 }
 
+// Bool returns key parsed with strconv.ParseBool ("true", "false", "1",
+// "0", and so on), or def if it is unset.
+func (l *Loader) Bool(key string, def bool) bool {
+	v, ok := l.get(key)
+	if !ok {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s: %q is not a boolean", key, v))
+		return def
+	}
+	return b
+}
+
 // Duration returns key parsed with time.ParseDuration (for example "10s"),
 // or def if it is unset.
 func (l *Loader) Duration(key string, def time.Duration) time.Duration {
