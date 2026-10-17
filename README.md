@@ -6,9 +6,10 @@ Four Go services (a REST gateway plus order, payment, and inventory) that place 
 
 ## Highlights
 
-- **Exactly one charge per order under failure:** across 5 chaos runs, 580 orders all confirmed with zero duplicate charges, with the payment service killed by SIGKILL mid-run each time ([reports](scripts/results/)).
-- **Load test:** 380.40 requests per second with 0 errors out of 79,898 requests, at p99 3.71 ms for reads and 39.16 ms for order creation (k6 ramp to 50 virtual users, cache on, one laptop; [results](loadtest/results/README.md)).
-- **Chaos in CI:** a 200-order chaos run executes in CI on every push and pull request, alongside the unit, integration, and end-to-end tests.
+- **Exactly one charge per order under failure:** 580 orders across 5 chaos runs, with the payment service killed by SIGKILL mid-run each time; 0 orders with more than one payment, and 25 redelivered charge commands skipped by deduplication ([per-run table](#chaos-runs), [raw reports](scripts/results/)).
+- **Load test:** 380 requests per second with 0 errors across 79,898 requests (cache-on run), at p99 3.71 ms for reads and 39.16 ms for order creation ([raw k6 summary](loadtest/results/20261017T003931Z-cache-on.json), [conditions](#load-test-conditions)).
+- **Tests:** 181 passing tests from one full run: 146 unit, 30 integration, 5 end-to-end ([how they were counted](#test-count)).
+- **Chaos in CI:** a 200-order chaos run executes on every push and pull request ([workflow](.github/workflows/ci.yml)).
 
 ## Architecture
 
@@ -179,17 +180,9 @@ CI (`.github/workflows/ci.yml`) runs on every push and pull request: buf lint, f
 
 ### Chaos test
 
-Each run places the orders through the gateway, kills the payment container with SIGKILL once it has started charging, keeps it down, restarts it, and waits for every order to finish. Raw reports are in [`scripts/results/`](scripts/results/).
+Each run places the orders through the gateway, kills the payment container with SIGKILL once it has started charging, keeps it down, restarts it, and waits for every order to finish. The per-run table is under [Chaos runs](#chaos-runs), and the raw reports are in [`scripts/results/`](scripts/results/).
 
-| Run | Orders | Charged at kill | Not final at kill | Payment down | Confirmed | Orders with more than one payment | Redeliveries skipped by dedup | Dead-lettered |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| [214348Z](scripts/results/chaos-20261016T214348Z.txt) | 50 | 15 | 47 | 24 s | 50 | 0 | 0 | 0 |
-| [214435Z](scripts/results/chaos-20261016T214435Z.txt) | 200 | 26 | 199 | 25 s | 200 | 0 | 25 | 0 |
-| [215641Z](scripts/results/chaos-20261016T215641Z.txt) | 30 | 11 | 19 | 23 s | 30 | 0 | 0 | 0 |
-| [220830Z](scripts/results/chaos-20261016T220830Z.txt) | 100 | 66 | 66 | 24 s | 100 | 0 | 0 | 0 |
-| [221223Z](scripts/results/chaos-20261016T221223Z.txt) | 200 | 2 | 200 | 23 s | 200 | 0 | 0 | 0 |
-
-Across the five runs, 580 orders were placed and 580 were confirmed with exactly one payment each. In the 200-order run at 214435Z, the restarted payment service received 25 charge commands it had already processed and skipped every one by `message_id`. In the run at 221223Z, 2 orders had been charged but their replies were still in payment's outbox at the kill; the relay sent them after the restart.
+Across the five runs, 580 orders were placed and 580 were confirmed with exactly one payment each. In the 200-order run at 214435Z, the restarted payment service received 25 charge commands it had already processed and skipped every one by `message_id`. In the run at 221223Z, 2 orders had been charged but their replies were still in payment's outbox at the kill; the relay sent them after the restart. No run added a dead-letter record.
 
 ### Load test
 
@@ -207,6 +200,49 @@ A k6 ramp test (0 to 50 virtual users over 1 minute, held for 2 minutes, down ov
 | Orders confirmed, with one payment each | 16,076 | 15,951 |
 
 The cache did not make reads faster in this setup: the catalog is seven rows that Postgres serves from memory, so a database read costs about as much as a Redis round trip, and each committed reservation deletes the cached list and product keys (hit ratio about 76%). Saga time is dominated by the outbox relays polling every 200 ms across four hops, not by Kafka or the consumers. Everything ran on one laptop in WSL2, load generator included, and the stack was not saturated: about 380 requests per second is the load 50 users with a 0.1 s pause generate, not the system's capacity.
+
+## How these numbers were measured
+
+### Load test conditions
+
+The k6 numbers come from [`20261017T003931Z-cache-on.json`](loadtest/results/20261017T003931Z-cache-on.json) (cache on) and [`20261017T004503Z-cache-off.json`](loadtest/results/20261017T004503Z-cache-off.json) (cache off); [`loadtest/results/README.md`](loadtest/results/README.md) has the full table, definitions, and rounding rule. The raw cache-on summary reports 79,898 requests at a rate of 380.409461 per second, with `http_req_failed` at 0. Each of the 50 virtual users pauses 0.1 s after every request, so 380 requests per second is the load those users generate, not the system's capacity; the stack was not saturated. Both runs were on one laptop in WSL2, with every container and the k6 load generator on that one host, and each mode ran once, so there is no variance estimate.
+
+### Chaos runs
+
+From [`scripts/results/chaos-*.txt`](scripts/results/):
+
+| Run | Orders | Charged at kill | Unfinished at kill | Payment downtime | Orders with more than one payment | Redeliveries skipped by dedup |
+| --- | --- | --- | --- | --- | --- | --- |
+| [20261016T214348Z](scripts/results/chaos-20261016T214348Z.txt) | 50 | 15 | 47 | 24 s | 0 | 0 |
+| [20261016T214435Z](scripts/results/chaos-20261016T214435Z.txt) | 200 | 26 | 199 | 25 s | 0 | 25 |
+| [20261016T215641Z](scripts/results/chaos-20261016T215641Z.txt) | 30 | 11 | 19 | 23 s | 0 | 0 |
+| [20261016T220830Z](scripts/results/chaos-20261016T220830Z.txt) | 100 | 66 | 66 | 24 s | 0 | 0 |
+| [20261016T221223Z](scripts/results/chaos-20261016T221223Z.txt) | 200 | 2 | 200 | 23 s | 0 | 0 |
+| **Total** | **580** | **120** | **531** | **119 s** | **0** | **25** |
+
+"Charged at kill" is the report's "payments recorded at kill", and "unfinished at kill" is its "not final at kill". Only the newest report (20261016T221223Z) records outbox resends after the restart (2), because the older reports predate that field; their resend counts are unknown, not zero.
+
+### Test count
+
+The 181 comes from one run on 2026-10-17 of `go test -json` with the `integration` build tag across all seven modules, with the Compose stack down, counting every passing test including subtests. The tag compiles the unit tests too, so each test ran exactly once.
+
+| Layer | Passing tests (including subtests) | Top-level test functions |
+| --- | --- | --- |
+| Unit | 146 | 49 |
+| Integration (testcontainers) | 30 | 30 |
+| End-to-end (Compose stack) | 5 | 1 |
+| **Total** | **181** | **80** |
+
+A test counts as a unit test if it is listed by `go test -list` without the tag; the end-to-end layer is the `tests/e2e` module (one test with four subtests). To reproduce the total:
+
+```bash
+make down
+out=$(mktemp)
+for m in pkg proto/gen/go services/gateway services/inventory services/order services/payment tests/e2e; do
+  (cd "$m" && GOWORK=off go test -json -tags integration -race -count=1 -timeout 20m ./...)
+done > "$out"
+grep '"Action":"pass"' "$out" | grep -c '"Test":'
+```
 
 ## Design decisions
 
