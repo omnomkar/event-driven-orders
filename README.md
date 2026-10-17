@@ -1,6 +1,14 @@
+[![CI](https://github.com/omnomkar/event-driven-orders/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/omnomkar/event-driven-orders/actions/workflows/ci.yml?query=branch%3Amain)
+
 # Event-Driven Order Platform
 
 Four Go services (a REST gateway plus order, payment, and inventory) that place an order across three databases without a distributed transaction. The order service orchestrates a saga over Apache Kafka: inventory reserves stock and prices the order, payment charges a tokenized card, and a failure at any step is compensated. Every state change is published through a transactional outbox, every consumer deduplicates by message ID, and failed messages are retried with backoff and then dead-lettered, so at-least-once delivery produces exactly one effect per order. The project includes a chaos test that kills the payment service mid-run, a Redis cache for catalog reads, Prometheus metrics, and a k6 load test with saved results.
+
+## Highlights
+
+- **Exactly one charge per order under failure:** across 5 chaos runs, 580 orders all confirmed with zero duplicate charges, with the payment service killed by SIGKILL mid-run each time ([reports](scripts/results/)).
+- **Load test:** 380.40 requests per second with 0 errors out of 79,898 requests, at p99 3.71 ms for reads and 39.16 ms for order creation (k6 ramp to 50 virtual users, cache on, one laptop; [results](loadtest/results/README.md)).
+- **Chaos in CI:** a 200-order chaos run executes in CI on every push and pull request, alongside the unit, integration, and end-to-end tests.
 
 ## Architecture
 
